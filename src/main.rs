@@ -1,5 +1,7 @@
 use std::{cmp::Ordering, collections::HashMap, fs::File, io::Write, rc::Rc};
 
+use bumpalo::Bump;
+
 use crate::{
     best_path_picker::{Priorities, Quality},
     chart_gen::{ChartGen, ConnectionPass, DecisionPath, DescisionBranches, Destination, NodeData},
@@ -18,29 +20,32 @@ mod roll_calc;
 
 fn main() {
     let available_rollers = [
-        // Ship {
-        //     hot: 301_200_000,
-        //     cold: 201_200_000,
-        // },
+        Ship {
+            hot: 301_200_000,
+            cold: 201_200_000,
+        },
         Ship {
             hot: 126_000_000,
             cold: 26_000_000,
         },
     ];
-    let hole = HoleInfo::from_kg(2_000_000_000);
+
+    let rollers_out = (0..(available_rollers.len())).map(|_| 0).collect();
+    let hole = HoleInfo::from_kg(3_000_000_000);
     let state = RollState {
         remaining_mass: hole.full_mass_range(),
-        rollers_out: vec![0, 0],
+        rollers_out,
         max_size_range: hole.max_range,
     };
     let start_state = HoleState::Full;
-    let priorities = Priorities::new([
+    let priorities = Priorities::new(vec![
+        Quality::MaxOut,
         Quality::ROProbability,
         Quality::AvgNumPasses,
-        Quality::MaxOut,
     ])
     .unwrap();
-    let plan = get_best_roll_plan(&available_rollers, state, start_state, &priorities);
+    let arena = Bump::new();
+    let plan = get_best_roll_plan(&available_rollers, state, start_state, &priorities, &arena);
     println!(
         "{}% {} {}",
         plan.qualities.roll_out_probability * 100.,
@@ -48,9 +53,9 @@ fn main() {
         plan.qualities.max_num_out
     );
 
-    let mut file = File::create("plan.txt").unwrap();
-    file.write_all(generate_flowchart(&plan).as_bytes())
-        .unwrap();
+    // let mut file = File::create("plan.txt").unwrap();
+    // file.write_all(generate_flowchart(&plan).as_bytes())
+    //     .unwrap();
 }
 
 fn generate_flowchart(plan: &RollPlan) -> String {

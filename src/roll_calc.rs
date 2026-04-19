@@ -1,38 +1,49 @@
-use std::{array, cmp::Ordering, hint, rc::Rc};
+use std::{array, f64::EPSILON, hint};
 
+use bumpalo::Bump;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
+use tinyvec::ArrayVec;
 
 use crate::{
     best_path_picker::{BestOptions, PathPicker, Priorities, Qualities},
     hole_info::{EMPTY_MR, Mass, MassRange, mr},
 };
 
+const EFFICIENT_NUM_ROLLERS: usize = 2;
+const EFFICIENT_NUM_CACHED_STEPS: usize = 2;
+const EFFICIENT_MAX_NUM_OUT: usize = 4;
+const EFFICIENT_NUM_AVAILABLE_ROLLERS: usize = 2;
+const EFFICIENT_NUM_SHIP_STATES: usize = 2;
+
+type Memoizer<'a> = FxHashMap<RollState, SmallVec<[&'a RollPlan<'a>; EFFICIENT_NUM_CACHED_STEPS]>>;
+
 #[derive(Debug, Clone)]
-pub struct RollPlan {
+pub struct RollPlan<'a> {
     pub qualities: Qualities,
-    pub decision: RollDecision,
+    pub decision: RollDecision<'a>,
     pub mass_range: MassRange,
     pub max_mass_range: MassRange,
 }
 
 #[derive(Debug, Clone)]
-pub struct RollDecision {
+pub struct RollDecision<'a> {
     pub can_close: bool,
-    pub crit: Option<Box<RollStep>>,
-    pub shrink: Option<Box<RollStep>>,
-    pub full: Option<Box<RollStep>>,
+    pub crit: Option<&'a RollStep<'a>>,
+    pub shrink: Option<&'a RollStep<'a>>,
+    pub full: Option<&'a RollStep<'a>>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct RollState {
     pub remaining_mass: MassRange,
-    pub rollers_out: Vec<usize>,
+    pub rollers_out: SmallVec<[u16; EFFICIENT_NUM_ROLLERS]>,
     pub max_size_range: MassRange,
 }
 
 #[derive(Debug, Clone)]
-pub struct RollStep {
-    pub next_plan: Rc<RollPlan>,
+pub struct RollStep<'a> {
+    pub next_plan: &'a RollPlan<'a>,
     pub direction: Direction,
     pub ship_state: ShipState,
     pub ship: Ship,
@@ -57,35 +68,50 @@ pub enum HoleState {
     Crit,
 }
 
+impl Default for HoleState {
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Ship {
     pub hot: Mass,
     pub cold: Mass,
 }
 
-pub fn get_best_roll_plan(
+impl Ship {
+    pub fn minimum_mass(&self) -> Mass {
+        self.cold
+    }
+}
+
+pub fn get_best_roll_plan<'a>(
     available_rollers: &[Ship],
     state: RollState,
     starting_state: HoleState,
     priorities: &Priorities,
-) -> RollPlan {
+    arena: &'a Bump,
+) -> RollPlan<'a> {
     RollPlan::clone(&get_best_roll_plan_rec(
         available_rollers,
         state,
         priorities,
         Some(starting_state),
         &mut FxHashMap::default(),
+        arena,
     ))
 }
 
-pub fn get_best_roll_plan_rec(
+pub fn get_best_roll_plan_rec<'a>(
     available_rollers: &[Ship],
     state: RollState,
     priorities: &Priorities,
     assume_state: Option<HoleState>,
-    memoization: &mut FxHashMap<RollState, Vec<Rc<RollPlan>>>,
-) -> Rc<RollPlan> {
-    let base_max_num_out = state.rollers_out.iter().sum::<usize>() as u32;
+    memoization: &mut Memoizer<'a>,
+    arena: &'a Bump,
+) -> &'a RollPlan<'a> {
+    let base_max_num_out = state.rollers_out.iter().sum::<u16>();
 
     // Fetch memoized best plan if it exists
     if let Some(cached_plan) = get_best_from_memoization(&state, base_max_num_out, memoization) {
@@ -148,7 +174,7 @@ pub fn get_best_roll_plan_rec(
     };
 
     if all_possible_states == possible_closed_states {
-        return Rc::new(RollPlan {
+        return arena.alloc(RollPlan {
             qualities: Qualities {
                 max_num_out: base_max_num_out,
                 roll_out_probability: closed_roll_out_probability,
@@ -172,7 +198,7 @@ pub fn get_best_roll_plan_rec(
 
     let first_step = steps.next().unwrap();
 
-    let mut states_to_explore = vec![];
+    let mut states_to_explore = ArrayVec::<[(usize, HoleState); 3]>::new();
     for i in 0..3 {
         if possible_states[i] > 0 {
             states_to_explore.push((i, [HoleState::Crit, HoleState::Shrink, HoleState::Full][i]));
@@ -180,7 +206,7 @@ pub fn get_best_roll_plan_rec(
     }
     // Compute one step for each possible hole state to get a baseline to prune with.
     for (i, hole_state) in states_to_explore.iter() {
-        compute_and_add_step(
+        compute_and_prune_or_add_step(
             &first_step,
             &mut best_paths,
             *hole_state,
@@ -189,13 +215,14 @@ pub fn get_best_roll_plan_rec(
             new_max_ranges[*i],
             &priorities,
             memoization,
+            arena,
         );
     }
 
     // Compute other steps avoiding exploring any pathways guarentied to result in a worse plan.
     for step in steps {
         for (i, hole_state) in states_to_explore.iter() {
-            compute_and_add_step(
+            compute_and_prune_or_add_step(
                 &step,
                 &mut best_paths,
                 *hole_state,
@@ -204,6 +231,7 @@ pub fn get_best_roll_plan_rec(
                 new_max_ranges[*i],
                 &priorities,
                 memoization,
+                arena,
             );
         }
     }
@@ -212,7 +240,7 @@ pub fn get_best_roll_plan_rec(
 
     let mut splits = splits.into_iter();
     let paths = best_paths.into_iter();
-    let mut best_plans = vec![];
+    let mut best_plans = SmallVec::new();
     let mut start;
     let mut end = Some(0);
     for steps in paths {
@@ -228,50 +256,57 @@ pub fn get_best_roll_plan_rec(
             &state,
             possible_states,
             base_max_num_out,
+            arena,
         );
         // When end is None the last one just has to be the worst case.
         for _ in start..(end.unwrap_or(start + 1)) {
-            best_plans.push(Rc::clone(&plan));
+            best_plans.push(&*plan);
         }
     }
 
-    let best_for_this_run = Rc::clone(get_best_plan_from_cached(base_max_num_out, &best_plans));
+    let best_for_this_run = get_best_plan_from_cached(base_max_num_out, &best_plans);
     memoization.insert(state, best_plans);
 
     best_for_this_run
 }
 
-fn get_best_from_memoization(
+fn get_best_from_memoization<'a>(
     state: &RollState,
-    min_max_num_out: u32,
-    memoization: &FxHashMap<RollState, Vec<Rc<RollPlan>>>,
-) -> Option<Rc<RollPlan>> {
+    min_max_num_out: u16,
+    memoization: &Memoizer<'a>,
+) -> Option<&'a RollPlan<'a>> {
     if let Some(cached_plans) = memoization.get(&state) {
-        Some(Rc::clone(get_best_plan_from_cached(
-            min_max_num_out,
-            cached_plans,
-        )))
+        Some(get_best_plan_from_cached(min_max_num_out, cached_plans))
     } else {
         None
     }
 }
 
-fn get_best_plan_from_cached(min_max_num_out: u32, cached_plans: &[Rc<RollPlan>]) -> &Rc<RollPlan> {
+fn get_best_plan_from_cached<'a>(
+    min_max_num_out: u16,
+    cached_plans: &[&'a RollPlan<'a>],
+) -> &'a RollPlan<'a> {
     &cached_plans[(min_max_num_out as usize).min(cached_plans.len() - 1)]
 }
 
-fn create_roll_plan(
+fn create_roll_plan<'a>(
     closed_roll_out_probability: f64,
     possible_closed_states: u128,
     all_possible_states: u128,
-    steps: [Option<RollStep>; 3],
+    steps: [Option<RollStep<'a>>; 3],
     state: &RollState,
     possible_states: [u128; 3],
-    mut min_max_num_out: u32,
-) -> Rc<RollPlan> {
+    mut min_max_num_out: u16,
+    arena: &'a Bump,
+) -> &'a mut RollPlan<'a> {
     let mut steps = steps.into_iter();
     // Get the final best plan for each hole state.
-    let plans = array::from_fn(|_| steps.next().unwrap().map(|best_next| Box::new(best_next)));
+    let plans = array::from_fn(|_| {
+        steps
+            .next()
+            .unwrap()
+            .map(|best_next| &*arena.alloc(best_next))
+    });
 
     let rollout_probabilities: [f64; 3] = array::from_fn(|i| {
         if let Some(plan) = &plans[i] {
@@ -311,7 +346,7 @@ fn create_roll_plan(
         );
     }
     let [crit, shrink, full] = plans;
-    Rc::new(RollPlan {
+    arena.alloc(RollPlan {
         qualities: Qualities {
             max_num_out: min_max_num_out,
             roll_out_probability,
@@ -328,26 +363,68 @@ fn create_roll_plan(
     })
 }
 
-fn compute_and_add_step(
+fn compute_and_prune_or_add_step<'a>(
     pass: &PotentialPass,
-    best_paths: &mut PathPicker,
+    best_paths: &mut PathPicker<'a, '_>,
     hole_state: HoleState,
     available_rollers: &[Ship],
     mass_range: MassRange,
     max_size_range: MassRange,
     priorities: &Priorities,
-    memoization: &mut FxHashMap<RollState, Vec<Rc<RollPlan>>>,
+    memoization: &mut Memoizer<'a>,
+    arena: &'a Bump,
 ) {
+    let path_state = RollState {
+        remaining_mass: mass_range - pass.mass,
+        rollers_out: pass.new_out_rollers.clone(),
+        max_size_range,
+    };
+
+    let mut minimum_needed_mass_to_avoid_rollout = 0;
+    let mut largest_ship: Option<Ship> = None;
+    for (i, num) in path_state.rollers_out.iter().enumerate() {
+        let ship = available_rollers[i];
+        minimum_needed_mass_to_avoid_rollout += ship.minimum_mass() * *num as Mass;
+
+        largest_ship = match largest_ship {
+            Some(prev) if ship.minimum_mass() > prev.minimum_mass() => Some(ship),
+            Some(prev) => Some(prev),
+            None => Some(ship),
+        };
+    }
+    // The hole can have 1 mass left with a single ship out, so remove largest ship and add 1 to avoid rollout
+    if let Some(ship) = largest_ship {
+        minimum_needed_mass_to_avoid_rollout -= ship.minimum_mass();
+        minimum_needed_mass_to_avoid_rollout += 1;
+    }
+
+    let minimum_rollout_chance =
+        if minimum_needed_mass_to_avoid_rollout >= path_state.remaining_mass.most {
+            // we know for sure a rollout will happen, but we do not know how likely it is.
+            // Use minimum value so that its worse than 0, but not 1.0.
+            EPSILON
+        } else {
+            0.0
+        };
+
+    let num_rollers_out = path_state.rollers_out.iter().sum();
+    let minimum_qualities = Qualities {
+        max_num_out: num_rollers_out,
+        roll_out_probability: minimum_rollout_chance,
+        average_num_passes: num_rollers_out as f64,
+    };
+
+    if best_paths.should_prune(hole_state, &minimum_qualities) {
+        return;
+    }
+
     let next_plan = get_best_roll_plan_rec(
         available_rollers,
-        RollState {
-            remaining_mass: mass_range - pass.mass,
-            rollers_out: pass.new_out_rollers.clone(),
-            max_size_range,
-        },
+        path_state,
         priorities,
         None,
         memoization,
+        arena,
     );
 
     best_paths.suggest(
@@ -362,15 +439,21 @@ fn compute_and_add_step(
 }
 
 struct PotentialPass {
-    new_out_rollers: Vec<usize>,
+    new_out_rollers: SmallVec<[u16; EFFICIENT_NUM_ROLLERS]>,
     mass: Mass,
     direction: Direction,
     ship_state: ShipState,
     ship: Ship,
 }
 
-fn get_steps(available_rollers: &[Ship], rollers_out: &Vec<usize>) -> Vec<PotentialPass> {
-    let mut potential_passes = vec![];
+const PREDICTED_NUM_POTENTIAL_PASSES: usize = (EFFICIENT_NUM_ROLLERS * EFFICIENT_MAX_NUM_OUT
+    + EFFICIENT_NUM_AVAILABLE_ROLLERS)
+    * EFFICIENT_NUM_SHIP_STATES;
+fn get_steps(
+    available_rollers: &[Ship],
+    rollers_out: &SmallVec<[u16; EFFICIENT_NUM_ROLLERS]>,
+) -> SmallVec<[PotentialPass; PREDICTED_NUM_POTENTIAL_PASSES]> {
+    let mut potential_passes = SmallVec::new();
     for i in 0..rollers_out.len() {
         if rollers_out[i] == 0 {
             continue;

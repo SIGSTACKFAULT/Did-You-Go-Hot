@@ -1,34 +1,46 @@
 use std::{array, cmp::Ordering};
 
+use smallvec::SmallVec;
+
 use crate::{
     hole_info::Mass,
-    roll_calc::{HoleState, RollPlan, RollStep, ShipState},
+    roll_calc::{HoleState, RollStep, ShipState},
 };
+
+const EFFICIENT_NUM_EQUAL_OR_POTENTIALLY_BETTER: usize = 2;
+const EFFICIENT_NUM_BEST_OPTIONS: usize = 2;
 
 // Invariants:
 // best_paths contains paths of equal quality or thoes with the potential for higher or equal qulaity if max out decreases
 // best_paths each vec must be sorted such that the left most element is best if highest_max_out = its max out
 //      E.G. As highest_max_out decreases, the left most elements are better than the right most paths
-pub struct PathPicker<'a> {
-    best_paths: [Vec<RollStep>; 3],
-    priorities: &'a Priorities,
+pub struct PathPicker<'a, 'b> {
+    best_paths: [SmallVec<[RollStep<'a>; EFFICIENT_NUM_EQUAL_OR_POTENTIALLY_BETTER]>; 3],
+    priorities: &'b Priorities,
     care_about_state: [bool; 3],
 }
 
-struct ComplexComparison {
-    new_best_path: Vec<RollStep>,
+struct ComplexComparison<'a> {
+    new_best_path: SmallVec<[RollStep<'a>; EFFICIENT_NUM_EQUAL_OR_POTENTIALLY_BETTER]>,
     insert_new_at: usize,
 }
 
-enum Comparison {
+enum Comparison<'a> {
     Equal,
     StrictlyBetter,
     StrictlyWorse,
-    Complex(ComplexComparison),
+    Complex(ComplexComparison<'a>),
 }
 
-impl<'a> PathPicker<'a> {
-    pub fn new(priorities: &'a Priorities, care_about_state: [bool; 3]) -> Self {
+enum ComparisonTheoretical {
+    Equal,
+    StrictlyBetter,
+    StrictlyWorse,
+    PotentiallyBetter,
+}
+
+impl<'a, 'b> PathPicker<'a, 'b> {
+    pub fn new(priorities: &'b Priorities, care_about_state: [bool; 3]) -> Self {
         Self {
             best_paths: Default::default(),
             priorities,
@@ -36,7 +48,37 @@ impl<'a> PathPicker<'a> {
         }
     }
 
-    pub fn suggest(&mut self, step: RollStep, hole_state: HoleState) {
+    pub fn should_prune(&self, hole_state: HoleState, minimum_qualities: &Qualities) -> bool {
+        let path_i = match hole_state {
+            HoleState::Crit => 0,
+            HoleState::Shrink => 1,
+            HoleState::Full => 2,
+        };
+        let Some(representative_sample) = self.best_paths[path_i].first() else {
+            return false;
+        };
+
+        matches!(
+            cmp_theoretical(
+                &representative_sample.next_plan.qualities,
+                minimum_qualities,
+                &self.priorities.qualities,
+                &self.best_paths,
+                path_i,
+                self.have_full_info(),
+            ),
+            ComparisonTheoretical::StrictlyWorse,
+        )
+    }
+
+    fn have_full_info(&self) -> bool {
+        self.care_about_state
+            .iter()
+            .enumerate()
+            .all(|(i, care)| !*care || !self.best_paths[i].is_empty())
+    }
+
+    pub fn suggest(&mut self, step: RollStep<'a>, hole_state: HoleState) {
         let path_i = match hole_state {
             HoleState::Crit => 0,
             HoleState::Shrink => 1,
@@ -46,11 +88,7 @@ impl<'a> PathPicker<'a> {
             self.best_paths[path_i].push(step);
         } else {
             let representative_sample = self.best_paths[path_i].first().unwrap();
-            let have_full_info = self
-                .care_about_state
-                .iter()
-                .enumerate()
-                .all(|(i, care)| !*care || !self.best_paths[i].is_empty());
+            let have_full_info = self.have_full_info();
             match cmp(
                 &representative_sample.next_plan.qualities,
                 &step.next_plan.qualities,
@@ -77,7 +115,7 @@ impl<'a> PathPicker<'a> {
 
     // Returns all best paths for each minimum max out floors.
     // Vec index = minimum max out floor
-    pub fn best(mut self) -> BestOptions {
+    pub fn best(mut self) -> BestOptions<'a> {
         // Get it to a single plan per max_num_out value
         // Keeping the highest mass being passed to try to improve path similarity.
         for path in self.best_paths.iter_mut() {
@@ -105,13 +143,14 @@ impl<'a> PathPicker<'a> {
             .max()
         else {
             return BestOptions {
-                best_paths: vec![],
-                splits: vec![],
+                best_paths: SmallVec::new(),
+                splits: SmallVec::new(),
             };
         };
 
-        let mut possible_combos: Vec<[Option<RollStep>; 3]> = vec![];
-        let mut splits = vec![];
+        let mut possible_combos: SmallVec<[[Option<RollStep>; 3]; EFFICIENT_NUM_BEST_OPTIONS]> =
+            SmallVec::new();
+        let mut splits = SmallVec::new();
 
         // push starting best combo
         possible_combos.push(array::from_fn(|j| self.best_paths[j].get(0).cloned()));
@@ -147,14 +186,14 @@ impl<'a> PathPicker<'a> {
 
 // best_paths[path_i] must be properly filtered such all elements with higher prioirty qualities which are better are not included.
 // best_paths must be sorted to match the invariants of PathPicker.
-fn cmp(
+fn cmp<'a>(
     existing: &Qualities,
     new: &Qualities,
     priorities: &[Quality],
-    best_paths: &[Vec<RollStep>; 3],
+    best_paths: &[SmallVec<[RollStep<'a>; EFFICIENT_NUM_EQUAL_OR_POTENTIALLY_BETTER]>; 3],
     path_i: usize,
     have_full_info: bool,
-) -> Comparison {
+) -> Comparison<'a> {
     if priorities.len() == 0 {
         return Comparison::Equal;
     }
@@ -172,7 +211,8 @@ fn cmp(
                 return Comparison::Equal;
             }
             // Either find out we are strictly worse than someone else or find all paths we are strictly better than.
-            let mut strictly_better_than = vec![];
+            let mut strictly_better_than =
+                SmallVec::<[usize; EFFICIENT_NUM_EQUAL_OR_POTENTIALLY_BETTER]>::new();
             let mut insert_at = 0;
             for (i, path) in best_paths[path_i].iter().enumerate() {
                 if path.next_plan.qualities.max_num_out < new.max_num_out {
@@ -215,7 +255,11 @@ fn cmp(
                 }
             }
 
-            let mut new_paths = vec![];
+            if strictly_better_than.is_empty() {
+                return Comparison::Equal;
+            }
+
+            let mut new_paths: SmallVec<[RollStep<'a>; 2]> = SmallVec::new();
             let mut better_than_i = 0;
             for (i, path) in best_paths[path_i].iter().enumerate() {
                 if better_than_i < strictly_better_than.len()
@@ -247,18 +291,108 @@ fn cmp(
     }
 }
 
-pub struct BestOptions {
-    pub best_paths: Vec<[Option<RollStep>; 3]>,
-    pub splits: Vec<usize>,
+// best_paths[path_i] must be properly filtered such all elements with higher prioirty qualities which are better are not included.
+// best_paths must be sorted to match the invariants of PathPicker.
+fn cmp_theoretical(
+    existing: &Qualities,
+    new: &Qualities,
+    priorities: &[Quality],
+    best_paths: &[SmallVec<[RollStep; EFFICIENT_NUM_EQUAL_OR_POTENTIALLY_BETTER]>; 3],
+    path_i: usize,
+    have_full_info: bool,
+) -> ComparisonTheoretical {
+    if priorities.len() == 0 {
+        return ComparisonTheoretical::Equal;
+    }
+
+    let comparison = match priorities[0] {
+        Quality::ROProbability => float_cmp_lower_better_theoretical(
+            existing.roll_out_probability,
+            new.roll_out_probability,
+        ),
+        Quality::AvgNumPasses => {
+            float_cmp_lower_better_theoretical(existing.average_num_passes, new.average_num_passes)
+        }
+        Quality::MaxOut => {
+            // Forcefully return Equal if we don't have full info because in the future a high max out may be fine
+            if !have_full_info {
+                return ComparisonTheoretical::Equal;
+            }
+            // Either find out we are strictly worse than someone else or find all paths we are strictly better than.
+            for path in &best_paths[path_i] {
+                match cmp_theoretical(
+                    &path.next_plan.qualities,
+                    new,
+                    &priorities[1..],
+                    best_paths,
+                    path_i,
+                    have_full_info,
+                ) {
+                    ComparisonTheoretical::StrictlyWorse => {
+                        // Found a path with less or equal max_num_out with better other qualities.
+                        // This is strictly better even if max_num_out is reduced
+                        if path.next_plan.qualities.max_num_out <= new.max_num_out {
+                            return ComparisonTheoretical::StrictlyWorse;
+                        }
+                    }
+                    ComparisonTheoretical::StrictlyBetter => {
+                        // it has an equal or better max_num_out so if all lower priorities are strictly better, it's strictly better
+                        if path.next_plan.qualities.max_num_out >= new.max_num_out {
+                            return ComparisonTheoretical::PotentiallyBetter;
+                        }
+                    }
+                    ComparisonTheoretical::Equal => {
+                        // If all else is equal but our max_num_out is worse, we are strictly worse.
+                        if path.next_plan.qualities.max_num_out < new.max_num_out {
+                            return ComparisonTheoretical::StrictlyWorse;
+                        } else if path.next_plan.qualities.max_num_out > new.max_num_out {
+                            return ComparisonTheoretical::PotentiallyBetter;
+                        }
+                    }
+                    ComparisonTheoretical::PotentiallyBetter => {
+                        unreachable!()
+                    }
+                }
+            }
+            ComparisonTheoretical::Equal
+        }
+    };
+    if matches!(comparison, ComparisonTheoretical::Equal) {
+        cmp_theoretical(
+            existing,
+            new,
+            &priorities[1..],
+            best_paths,
+            path_i,
+            have_full_info,
+        )
+    } else {
+        comparison
+    }
 }
 
-fn float_cmp_lower_better(a: f64, b: f64) -> Comparison {
+pub struct BestOptions<'a> {
+    pub best_paths: SmallVec<[[Option<RollStep<'a>>; 3]; EFFICIENT_NUM_BEST_OPTIONS]>,
+    pub splits: SmallVec<[usize; EFFICIENT_NUM_BEST_OPTIONS]>,
+}
+
+fn float_cmp_lower_better<'a>(a: f64, b: f64) -> Comparison<'a> {
     if a < b {
         Comparison::StrictlyWorse
     } else if a > b {
         Comparison::StrictlyBetter
     } else {
         Comparison::Equal
+    }
+}
+
+fn float_cmp_lower_better_theoretical(a: f64, b: f64) -> ComparisonTheoretical {
+    if a < b {
+        ComparisonTheoretical::StrictlyWorse
+    } else if a > b {
+        ComparisonTheoretical::StrictlyBetter
+    } else {
+        ComparisonTheoretical::Equal
     }
 }
 
@@ -277,11 +411,11 @@ pub enum Quality {
 }
 
 pub struct Priorities {
-    qualities: [Quality; 3],
+    qualities: Vec<Quality>,
 }
 
 impl Priorities {
-    pub fn new(qualities: [Quality; 3]) -> Option<Self> {
+    pub fn new(qualities: Vec<Quality>) -> Option<Self> {
         for i in 0..qualities.len() {
             for j in i + 1..qualities.len() {
                 if qualities[i] == qualities[j] {
@@ -295,7 +429,7 @@ impl Priorities {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Qualities {
-    pub max_num_out: u32,
+    pub max_num_out: u16,
     pub roll_out_probability: f64,
     pub average_num_passes: f64,
 }
