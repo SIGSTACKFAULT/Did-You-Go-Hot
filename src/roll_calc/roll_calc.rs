@@ -68,7 +68,7 @@ impl RollersOut {
 
         // Clear the old byte and insert the new byte
         self.0 &= !(0xFF << shift);
-        self.0 |= (current_count + 1) << shift;
+        self.0 |= (current_count.strict_add(1)) << shift;
     }
 
     pub fn sub(&mut self, ship_index: usize) {
@@ -78,7 +78,7 @@ impl RollersOut {
 
         // Clear the old byte and insert the new byte
         self.0 &= !(0xFF << shift);
-        self.0 |= (current_count + 1) << shift;
+        self.0 |= (current_count - 1) << shift;
     }
 
     /// Gets the count for a given ship index
@@ -226,7 +226,7 @@ pub fn get_best_roll_plan_rec<'a>(
     let all_possible_states = possible_closed_states + possible_states.iter().sum::<u128>();
 
     // If the hole is closed, the rollout probability is 0 if all rollers are in. Otherwise, it's 1.
-    let closed_roll_out_probability = if state.rollers_out.any_out() {
+    let closed_roll_out_probability = if !state.rollers_out.any_out() {
         0.0
     } else {
         1.0
@@ -435,7 +435,7 @@ fn compute_and_prune_or_add_step<'a>(
 ) {
     let path_state = RollState {
         remaining_mass: mass_range - pass.mass,
-        rollers_out: pass.new_out_rollers.clone(),
+        rollers_out: pass.new_out_rollers,
         max_size_range,
     };
 
@@ -517,12 +517,12 @@ fn get_steps(
         if rollers_out.get(i) == 0 {
             continue;
         }
-        let mut new_out_rollers = rollers_out.clone();
+        let mut new_out_rollers = *rollers_out;
         let in_ship = available_rollers[i];
         new_out_rollers.sub(i);
 
         potential_passes.push(PotentialPass {
-            new_out_rollers: new_out_rollers.clone(),
+            new_out_rollers: new_out_rollers,
             mass: in_ship.cold,
             direction: Direction::In,
             ship_state: ShipState::Cold,
@@ -538,10 +538,10 @@ fn get_steps(
     }
 
     for (i, out_ship) in available_rollers.iter().enumerate() {
-        let mut new_out_rollers = rollers_out.clone();
+        let mut new_out_rollers = *rollers_out;
         new_out_rollers.add(i);
         potential_passes.push(PotentialPass {
-            new_out_rollers: new_out_rollers.clone(),
+            new_out_rollers: new_out_rollers,
             mass: out_ship.cold,
             direction: Direction::Out,
             ship_state: ShipState::Cold,
@@ -633,7 +633,7 @@ fn overlap(range1: &MassRange, range2: &MassRange) -> MassRange {
 mod tests {
     use crate::{
         hole_info::{HoleInfo, mr},
-        roll_calc::{
+        roll_calc::roll_calc::{
             crit_range, full_range, overlap, shrink_range, update_max_range_from_crit,
             update_max_range_from_full, update_max_range_from_shrink,
         },
