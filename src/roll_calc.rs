@@ -1,18 +1,18 @@
-use std::{cmp::Ordering, rc::Rc};
+use std::{array, cmp::Ordering, hint, rc::Rc};
 
 use rustc_hash::FxHashMap;
 
 use crate::{
-    best_path_picker::{PathCmpFn, PathPicker},
+    best_path_picker::{BestOptions, PathPicker, Priorities, Qualities},
     hole_info::{EMPTY_MR, Mass, MassRange, mr},
 };
 
 #[derive(Debug, Clone)]
 pub struct RollPlan {
-    pub max_num_out: u32,
-    pub roll_out_probability: f64,
-    pub average_num_passes: f64,
+    pub qualities: Qualities,
     pub decision: RollDecision,
+    pub mass_range: MassRange,
+    pub max_mass_range: MassRange,
 }
 
 #[derive(Debug, Clone)]
@@ -67,302 +67,374 @@ pub fn get_best_roll_plan(
     available_rollers: &[Ship],
     state: RollState,
     starting_state: HoleState,
-    path_cmp: PathCmpFn,
+    priorities: &Priorities,
 ) -> RollPlan {
     RollPlan::clone(&get_best_roll_plan_rec(
         available_rollers,
         state,
-        path_cmp,
+        priorities,
         Some(starting_state),
         &mut FxHashMap::default(),
     ))
 }
 
-// Returns None if impossible
 pub fn get_best_roll_plan_rec(
     available_rollers: &[Ship],
     state: RollState,
-    path_cmp: PathCmpFn,
+    priorities: &Priorities,
     assume_state: Option<HoleState>,
-    memoization: &mut FxHashMap<RollState, Rc<RollPlan>>,
+    memoization: &mut FxHashMap<RollState, Vec<Rc<RollPlan>>>,
 ) -> Rc<RollPlan> {
-    if let Some(cached_plan) = memoization.get(&state) {
-        return Rc::clone(cached_plan);
+    let base_max_num_out = state.rollers_out.iter().sum::<usize>() as u32;
+
+    // Fetch memoized best plan if it exists
+    if let Some(cached_plan) = get_best_from_memoization(&state, base_max_num_out, memoization) {
+        return cached_plan;
     }
 
-    let mut mass_range_for_closed = overlap(&closed_range(), &state.remaining_mass);
-    let mut mass_range_for_crit =
-        overlap(&crit_range(&state.max_size_range), &state.remaining_mass);
-    let mut mass_range_for_shrink =
-        overlap(&shrink_range(&state.max_size_range), &state.remaining_mass);
-    let mut mass_range_for_full =
-        overlap(&full_range(&state.max_size_range), &state.remaining_mass);
+    // calculate the possible masses that the hole could be if it were to become each state
+    let max_mass_ranges = [
+        crit_range(&state.max_size_range),
+        shrink_range(&state.max_size_range),
+        full_range(&state.max_size_range),
+    ];
+    let mut mass_ranges: [MassRange; 3] =
+        array::from_fn(|i| overlap(&max_mass_ranges[i], &state.remaining_mass));
+    let mass_range_for_closed = overlap(&closed_range(), &state.remaining_mass);
 
+    // If we are assuming a specific state (likely because the user knows the hole state) make all other possibilities not possible
     if let Some(starting_state) = assume_state {
-        match starting_state {
-            HoleState::Crit => {
-                mass_range_for_closed = EMPTY_MR;
-                mass_range_for_shrink = EMPTY_MR;
-                mass_range_for_full = EMPTY_MR;
-            }
-            HoleState::Shrink => {
-                mass_range_for_closed = EMPTY_MR;
-                mass_range_for_crit = EMPTY_MR;
-                mass_range_for_full = EMPTY_MR;
-            }
-            HoleState::Full => {
-                mass_range_for_closed = EMPTY_MR;
-                mass_range_for_crit = EMPTY_MR;
-                mass_range_for_shrink = EMPTY_MR;
+        // Cold because should only ever happen in the first call.
+        hint::cold_path();
+        let stay_full = match starting_state {
+            HoleState::Crit => 0,
+            HoleState::Shrink => 1,
+            HoleState::Full => 2,
+        };
+        for i in 0..3 {
+            if i != stay_full {
+                mass_ranges[i] = EMPTY_MR;
             }
         }
     }
 
-    let possible_closed_states = possible_states(mass_range_for_closed, state.max_size_range);
-    let mut max_num_out = state.rollers_out.iter().sum::<usize>() as u32;
+    let possible_closed_states = calc_possible_states(mass_range_for_closed, state.max_size_range);
 
-    let mut best_paths = PathPicker::new(path_cmp);
+    // Assuming it became that state, calculate the new max mass ranges for each hole based on the possible mass range.
+    const MAX_RANGE_UPDATERS: [fn(&MassRange, &MassRange) -> MassRange; 3] = [
+        update_max_range_from_crit,
+        update_max_range_from_shrink,
+        update_max_range_from_full,
+    ];
+    let new_max_ranges: [MassRange; 3] =
+        array::from_fn(|i| MAX_RANGE_UPDATERS[i](&mass_ranges[i], &state.max_size_range));
 
-    let possible_crit_states = if !mass_range_for_crit.is_empty() {
-        let new_max_range = update_max_range_from_crit(&mass_range_for_crit, &state.max_size_range);
-        add_best_steps(
-            available_rollers,
-            mass_range_for_crit,
-            new_max_range,
-            &state.rollers_out,
-            &mut best_paths,
-            HoleState::Crit,
-            path_cmp,
-            memoization,
-        );
-        possible_states(mass_range_for_crit, new_max_range)
-    } else {
-        0
-    };
-    let possible_shrink_states = if !mass_range_for_shrink.is_empty() {
-        let new_max_range =
-            update_max_range_from_shrink(&mass_range_for_shrink, &state.max_size_range);
-        add_best_steps(
-            available_rollers,
-            mass_range_for_shrink,
-            new_max_range,
-            &state.rollers_out,
-            &mut best_paths,
-            HoleState::Shrink,
-            path_cmp,
-            memoization,
-        );
-        possible_states(mass_range_for_shrink, new_max_range)
-    } else {
-        0
-    };
-    let possible_full_states = if !mass_range_for_full.is_empty() {
-        let new_max_range = update_max_range_from_full(&mass_range_for_full, &state.max_size_range);
-        add_best_steps(
-            available_rollers,
-            mass_range_for_full,
-            new_max_range,
-            &state.rollers_out,
-            &mut best_paths,
-            HoleState::Full,
-            path_cmp,
-            memoization,
-        );
-        possible_states(mass_range_for_full, new_max_range)
-    } else {
-        0
-    };
-
-    let final_states = best_paths.best();
-
-    let mut paths = final_states.into_iter();
-    let crit_plan = paths.next().unwrap().map(|best_next| {
-        max_num_out = max_num_out.max(best_next.next_plan.max_num_out);
-        Box::new(best_next)
-    });
-    let shrink_plan = paths.next().unwrap().map(|best_next| {
-        max_num_out = max_num_out.max(best_next.next_plan.max_num_out);
-        Box::new(best_next)
-    });
-    let full_plan = paths.next().unwrap().map(|best_next| {
-        max_num_out = max_num_out.max(best_next.next_plan.max_num_out);
-        Box::new(best_next)
+    // Get the possible number of states that could result in each hole state.
+    let possible_states: [u128; 3] = array::from_fn(|i| {
+        if !mass_ranges[i].is_empty() {
+            calc_possible_states(mass_ranges[i], new_max_ranges[i])
+        } else {
+            0
+        }
     });
 
+    let all_possible_states = possible_closed_states + possible_states.iter().sum::<u128>();
+
+    // If the hole is closed, the rollout probability is 0 if all rollers are in. Otherwise, it's 1.
     let closed_roll_out_probability = if state.rollers_out.iter().all(|x| *x == 0) {
         0.0
     } else {
         1.0
     };
-    let (crit_rollout_probability, crit_average_passes) = if let Some(plan) = &crit_plan {
-        (
-            plan.next_plan.roll_out_probability,
-            plan.next_plan.average_num_passes,
-        )
-    } else {
-        (0.0, 0.0)
-    };
-    let (shrink_rollout_probability, shrink_average_passes) = if let Some(plan) = &shrink_plan {
-        (
-            plan.next_plan.roll_out_probability,
-            plan.next_plan.average_num_passes,
-        )
-    } else {
-        (0.0, 0.0)
-    };
-    let (full_rollout_probability, full_average_passes) = if let Some(plan) = &full_plan {
-        (
-            plan.next_plan.roll_out_probability,
-            plan.next_plan.average_num_passes,
-        )
-    } else {
-        (0.0, 0.0)
-    };
 
-    let possible_states = possible_closed_states
-        + possible_crit_states
-        + possible_shrink_states
-        + possible_full_states;
+    if all_possible_states == possible_closed_states {
+        return Rc::new(RollPlan {
+            qualities: Qualities {
+                max_num_out: base_max_num_out,
+                roll_out_probability: closed_roll_out_probability,
+                average_num_passes: 0.0,
+            },
+            decision: RollDecision {
+                can_close: true,
+                crit: None,
+                shrink: None,
+                full: None,
+            },
+            mass_range: state.remaining_mass,
+            max_mass_range: state.max_size_range,
+        });
+    }
 
-    let closed_probability = geometric_probability(possible_closed_states, possible_states);
-    let crit_probability = geometric_probability(possible_crit_states, possible_states);
-    let shrink_probability = geometric_probability(possible_shrink_states, possible_states);
-    let full_probability = geometric_probability(possible_full_states, possible_states);
-    let total_probability =
-        closed_probability + crit_probability + shrink_probability + full_probability;
-    if (total_probability * 10_000.0).round() / 10_000.0 != 1. {
-        println!(
-            "{total_probability}, l{closed_probability}, c{crit_probability}, s{shrink_probability}, f{full_probability}"
+    let cared_about_states = array::from_fn(|i| possible_states[i] > 0);
+    let mut best_paths = PathPicker::new(priorities, cared_about_states);
+
+    let mut steps = get_steps(available_rollers, &state.rollers_out).into_iter();
+
+    let first_step = steps.next().unwrap();
+
+    let mut states_to_explore = vec![];
+    for i in 0..3 {
+        if possible_states[i] > 0 {
+            states_to_explore.push((i, [HoleState::Crit, HoleState::Shrink, HoleState::Full][i]));
+        }
+    }
+    // Compute one step for each possible hole state to get a baseline to prune with.
+    for (i, hole_state) in states_to_explore.iter() {
+        compute_and_add_step(
+            &first_step,
+            &mut best_paths,
+            *hole_state,
+            available_rollers,
+            mass_ranges[*i],
+            new_max_ranges[*i],
+            &priorities,
+            memoization,
         );
     }
 
-    let roll_out_probability = closed_roll_out_probability * closed_probability
-        + crit_rollout_probability * crit_probability
-        + shrink_rollout_probability * shrink_probability
-        + full_rollout_probability * full_probability;
+    // Compute other steps avoiding exploring any pathways guarentied to result in a worse plan.
+    for step in steps {
+        for (i, hole_state) in states_to_explore.iter() {
+            compute_and_add_step(
+                &step,
+                &mut best_paths,
+                *hole_state,
+                available_rollers,
+                mass_ranges[*i],
+                new_max_ranges[*i],
+                &priorities,
+                memoization,
+            );
+        }
+    }
 
-    let average_num_passes = 1.0
-        + crit_probability * crit_average_passes
-        + shrink_probability * shrink_average_passes
-        + full_probability * full_average_passes;
+    let BestOptions { best_paths, splits } = best_paths.best();
 
-    let best_plan = Rc::new(RollPlan {
-        max_num_out,
-        roll_out_probability,
-        average_num_passes,
-        decision: RollDecision {
-            can_close: possible_closed_states != 0,
-            crit: crit_plan,
-            shrink: shrink_plan,
-            full: full_plan,
-        },
-    });
+    let mut splits = splits.into_iter();
+    let paths = best_paths.into_iter();
+    let mut best_plans = vec![];
+    let mut start;
+    let mut end = Some(0);
+    for steps in paths {
+        // None end means infinite
+        start = end.unwrap();
+        end = splits.next();
 
-    memoization.insert(state, Rc::clone(&best_plan));
-    best_plan
+        let plan = create_roll_plan(
+            closed_roll_out_probability,
+            possible_closed_states,
+            all_possible_states,
+            steps,
+            &state,
+            possible_states,
+            base_max_num_out,
+        );
+        // When end is None the last one just has to be the worst case.
+        for _ in start..(end.unwrap_or(start + 1)) {
+            best_plans.push(Rc::clone(&plan));
+        }
+    }
+
+    let best_for_this_run = Rc::clone(get_best_plan_from_cached(base_max_num_out, &best_plans));
+    memoization.insert(state, best_plans);
+
+    best_for_this_run
 }
 
-fn add_best_steps(
-    available_rollers: &[Ship],
-    mass_range: MassRange,
-    new_max_mass_range: MassRange,
-    rollers_out: &Vec<usize>,
-    best_paths: &mut PathPicker,
-    hole_state: HoleState,
-    path_cmp: PathCmpFn,
-    memoization: &mut FxHashMap<RollState, Rc<RollPlan>>,
-) {
-    let in_passes = (0..rollers_out.len())
-        .flat_map(|i| {
-            if rollers_out[i] == 0 {
-                return None;
-            }
-            let mut new_out_rollers = rollers_out.clone();
-            let in_ship = available_rollers[i];
-            new_out_rollers[i] -= 1;
-
-            Some([
-                (
-                    new_out_rollers.clone(),
-                    in_ship.cold,
-                    Direction::In,
-                    ShipState::Cold,
-                    in_ship,
-                ),
-                (
-                    new_out_rollers,
-                    in_ship.hot,
-                    Direction::In,
-                    ShipState::Hot,
-                    in_ship,
-                ),
-            ])
-        })
-        .flatten();
-
-    let out_passes = available_rollers
-        .iter()
-        .enumerate()
-        .flat_map(|(i, out_ship)| {
-            let mut new_out_rollers = rollers_out.clone();
-            new_out_rollers[i] += 1;
-            [
-                (
-                    new_out_rollers.clone(),
-                    out_ship.cold,
-                    Direction::Out,
-                    ShipState::Cold,
-                    *out_ship,
-                ),
-                (
-                    new_out_rollers,
-                    out_ship.hot,
-                    Direction::Out,
-                    ShipState::Hot,
-                    *out_ship,
-                ),
-            ]
-        });
-
-    let mut possibility_iter = in_passes.into_iter().chain(out_passes).map(
-        |(out_rollers, mass, direction, ship_state, ship)| RollStep {
-            next_plan: get_best_roll_plan_rec(
-                available_rollers,
-                RollState {
-                    remaining_mass: mass_range - mass,
-                    rollers_out: out_rollers,
-                    max_size_range: new_max_mass_range,
-                },
-                path_cmp,
-                None,
-                memoization,
-            ),
-            direction,
-            ship_state,
-            ship,
-        },
-    );
-
-    for possibility in possibility_iter {
-        best_paths.suggest(possibility, hole_state);
+fn get_best_from_memoization(
+    state: &RollState,
+    min_max_num_out: u32,
+    memoization: &FxHashMap<RollState, Vec<Rc<RollPlan>>>,
+) -> Option<Rc<RollPlan>> {
+    if let Some(cached_plans) = memoization.get(&state) {
+        Some(Rc::clone(get_best_plan_from_cached(
+            min_max_num_out,
+            cached_plans,
+        )))
+    } else {
+        None
     }
 }
 
+fn get_best_plan_from_cached(min_max_num_out: u32, cached_plans: &[Rc<RollPlan>]) -> &Rc<RollPlan> {
+    &cached_plans[(min_max_num_out as usize).min(cached_plans.len() - 1)]
+}
+
+fn create_roll_plan(
+    closed_roll_out_probability: f64,
+    possible_closed_states: u128,
+    all_possible_states: u128,
+    steps: [Option<RollStep>; 3],
+    state: &RollState,
+    possible_states: [u128; 3],
+    mut min_max_num_out: u32,
+) -> Rc<RollPlan> {
+    let mut steps = steps.into_iter();
+    // Get the final best plan for each hole state.
+    let plans = array::from_fn(|_| steps.next().unwrap().map(|best_next| Box::new(best_next)));
+
+    let rollout_probabilities: [f64; 3] = array::from_fn(|i| {
+        if let Some(plan) = &plans[i] {
+            plan.next_plan.qualities.roll_out_probability
+        } else {
+            0.0
+        }
+    });
+
+    let average_passes: [f64; 3] = array::from_fn(|i| {
+        if let Some(plan) = &plans[i] {
+            plan.next_plan.qualities.average_num_passes
+        } else {
+            0.0
+        }
+    });
+
+    let closed_probability = geometric_probability(possible_closed_states, all_possible_states);
+    let probabilities: [f64; 3] =
+        array::from_fn(|i| geometric_probability(possible_states[i], all_possible_states));
+
+    let roll_out_probability = closed_probability * closed_roll_out_probability
+        + probabilities[0] * rollout_probabilities[0]
+        + probabilities[1] * rollout_probabilities[1]
+        + probabilities[2] * rollout_probabilities[2];
+
+    let average_num_passes = 1.0
+        + probabilities[0] * average_passes[0]
+        + probabilities[1] * average_passes[1]
+        + probabilities[2] * average_passes[2];
+
+    for plan in &plans {
+        min_max_num_out = min_max_num_out.max(
+            plan.as_ref()
+                .map(|x| x.next_plan.qualities.max_num_out)
+                .unwrap_or(0),
+        );
+    }
+    let [crit, shrink, full] = plans;
+    Rc::new(RollPlan {
+        qualities: Qualities {
+            max_num_out: min_max_num_out,
+            roll_out_probability,
+            average_num_passes,
+        },
+        decision: RollDecision {
+            can_close: possible_closed_states != 0,
+            crit,
+            shrink,
+            full,
+        },
+        mass_range: state.remaining_mass,
+        max_mass_range: state.max_size_range,
+    })
+}
+
+fn compute_and_add_step(
+    pass: &PotentialPass,
+    best_paths: &mut PathPicker,
+    hole_state: HoleState,
+    available_rollers: &[Ship],
+    mass_range: MassRange,
+    max_size_range: MassRange,
+    priorities: &Priorities,
+    memoization: &mut FxHashMap<RollState, Vec<Rc<RollPlan>>>,
+) {
+    let next_plan = get_best_roll_plan_rec(
+        available_rollers,
+        RollState {
+            remaining_mass: mass_range - pass.mass,
+            rollers_out: pass.new_out_rollers.clone(),
+            max_size_range,
+        },
+        priorities,
+        None,
+        memoization,
+    );
+
+    best_paths.suggest(
+        RollStep {
+            next_plan,
+            direction: pass.direction,
+            ship_state: pass.ship_state,
+            ship: pass.ship,
+        },
+        hole_state,
+    );
+}
+
+struct PotentialPass {
+    new_out_rollers: Vec<usize>,
+    mass: Mass,
+    direction: Direction,
+    ship_state: ShipState,
+    ship: Ship,
+}
+
+fn get_steps(available_rollers: &[Ship], rollers_out: &Vec<usize>) -> Vec<PotentialPass> {
+    let mut potential_passes = vec![];
+    for i in 0..rollers_out.len() {
+        if rollers_out[i] == 0 {
+            continue;
+        }
+        let mut new_out_rollers = rollers_out.clone();
+        let in_ship = available_rollers[i];
+        new_out_rollers[i] -= 1;
+
+        potential_passes.push(PotentialPass {
+            new_out_rollers: new_out_rollers.clone(),
+            mass: in_ship.cold,
+            direction: Direction::In,
+            ship_state: ShipState::Cold,
+            ship: in_ship,
+        });
+        potential_passes.push(PotentialPass {
+            new_out_rollers: new_out_rollers,
+            mass: in_ship.hot,
+            direction: Direction::In,
+            ship_state: ShipState::Hot,
+            ship: in_ship,
+        });
+    }
+
+    for (i, out_ship) in available_rollers.iter().enumerate() {
+        let mut new_out_rollers = rollers_out.clone();
+        new_out_rollers[i] += 1;
+        potential_passes.push(PotentialPass {
+            new_out_rollers: new_out_rollers.clone(),
+            mass: out_ship.cold,
+            direction: Direction::Out,
+            ship_state: ShipState::Cold,
+            ship: *out_ship,
+        });
+        potential_passes.push(PotentialPass {
+            new_out_rollers: new_out_rollers,
+            mass: out_ship.hot,
+            direction: Direction::Out,
+            ship_state: ShipState::Hot,
+            ship: *out_ship,
+        })
+    }
+
+    potential_passes
+}
+
 fn geometric_probability(possibilities: u128, all_possibilities: u128) -> f64 {
+    if all_possibilities == 0 {
+        panic!()
+    }
     possibilities as f64 / all_possibilities as f64
 }
 
-fn possible_states(mass_range: MassRange, max_mass_range: MassRange) -> u128 {
+fn calc_possible_states(mass_range: MassRange, max_mass_range: MassRange) -> u128 {
     mass_range.size() as u128 * max_mass_range.size() as u128
 }
 
 fn update_max_range_from_crit(possible_mass: &MassRange, max_mass_range: &MassRange) -> MassRange {
-    // +1 because if its crit the threshold is ever so slightly more than it is.
-    let minimum_crit_threshold = possible_mass.least + 1;
-    let smallest_possible_hole = minimum_crit_threshold * 10;
-    overlap(
-        max_mass_range,
-        &mr(smallest_possible_hole, max_mass_range.most),
+    // +1 because if its shrink the threshold is ever so slightly more than it is.
+    let minimum_shrink_threshold = possible_mass.least;
+    let smallest_possible_hole = minimum_shrink_threshold * 10 + 1;
+    mr(
+        smallest_possible_hole.max(max_mass_range.least),
+        max_mass_range.most,
     )
 }
 
@@ -370,24 +442,24 @@ fn update_max_range_from_shrink(
     possible_mass: &MassRange,
     max_mass_range: &MassRange,
 ) -> MassRange {
-    let largest_crit_threshold = possible_mass.least;
+    let largest_crit_threshold = possible_mass.most;
     let largest_possible_hole = largest_crit_threshold * 10;
 
     // +1 because if its shrink the threshold is ever so slightly more than it is.
-    let minimum_shrink_threshold = possible_mass.most + 1;
-    let smallest_possible_hole = minimum_shrink_threshold * 2;
-    overlap(
-        max_mass_range,
-        &mr(smallest_possible_hole, largest_possible_hole),
+    let minimum_shrink_threshold = possible_mass.least;
+    let smallest_possible_hole = minimum_shrink_threshold * 2 + 1;
+    mr(
+        smallest_possible_hole.max(max_mass_range.least),
+        largest_possible_hole.min(max_mass_range.most),
     )
 }
 
 fn update_max_range_from_full(possible_mass: &MassRange, max_mass_range: &MassRange) -> MassRange {
-    let largest_shrink_threshold = possible_mass.least;
+    let largest_shrink_threshold = possible_mass.most;
     let largest_possible_hole = largest_shrink_threshold * 2;
-    overlap(
-        max_mass_range,
-        &mr(max_mass_range.least, largest_possible_hole),
+    mr(
+        max_mass_range.least,
+        largest_possible_hole.min(max_mass_range.most),
     )
 }
 
@@ -499,6 +571,18 @@ mod tests {
         let hole = HoleInfo::from_kg(2_000_000_000);
         assert_eq!(
             update_max_range_from_full(&mr(1_000_000_000, 1_200_000_000), &hole.max_range),
+            mr(1_800_000_000, 2_200_000_000)
+        );
+
+        let hole = HoleInfo::from_kg(2_000_000_000);
+        assert_eq!(
+            update_max_range_from_full(&mr(900_000_000, 2_200_000_000), &hole.max_range),
+            mr(1_800_000_000, 2_200_000_000)
+        );
+
+        let hole = HoleInfo::from_kg(2_000_000_000);
+        assert_eq!(
+            update_max_range_from_full(&mr(900_000_000, 1_000_000_000), &hole.max_range),
             mr(1_800_000_000, 2_000_000_000)
         );
     }

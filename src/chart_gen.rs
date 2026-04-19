@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::{roll_calc::{Direction, Ship, ShipState}};
 
@@ -6,6 +6,7 @@ use crate::{roll_calc::{Direction, Ship, ShipState}};
 #[derive(Debug, PartialEq)]
 pub struct NodeData {
     pub rollout_probability: f64,
+    pub extra_info: String,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
@@ -14,7 +15,7 @@ pub enum Destination {
     Node(usize)
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct ConnectionPass {
     pub ship: Ship,
     pub state: ShipState,
@@ -38,8 +39,6 @@ pub enum DescisionBranches {
 pub struct ChartGen {
     ids: HashMap<usize, NodeData>,
     connections: HashMap<(usize, Destination, DescisionBranches), Option<HashMap<ConnectionPass, u32>>>,
-    closed_connections: HashSet<usize>,
-    unique_id: i32,
 }
 
 impl ChartGen {
@@ -47,8 +46,6 @@ impl ChartGen {
         Self {
             ids: HashMap::new(),
             connections: HashMap::new(),
-            closed_connections: HashSet::new(),
-            unique_id: -1
         }
     }
 
@@ -70,7 +67,7 @@ impl ChartGen {
     pub fn to_text_chart(&self) -> String {
         let mut chart = "---\ntitle: Roll Plan\n---\nflowchart TD\n".to_string();
         for (id, data) in &self.ids {
-            chart.push_str(&format!("{id}[{}%]\n", data.rollout_probability * 100.0));
+            chart.push_str(&format!("{id}[{}%\n{}]\n", data.rollout_probability * 100.0, data.extra_info));
         }
 
         let mut unique_id = -1;

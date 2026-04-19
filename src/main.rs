@@ -1,29 +1,31 @@
 use std::{cmp::Ordering, collections::HashMap, fs::File, io::Write, rc::Rc};
 
 use crate::{
+    best_path_picker::{Priorities, Quality},
     chart_gen::{ChartGen, ConnectionPass, DecisionPath, DescisionBranches, Destination, NodeData},
-    hole_info::HoleInfo,
+    hole_info::{HoleInfo, Mass},
     roll_calc::{
-        Direction, HoleState, RollDecision, RollPlan, RollState, RollStep, Ship, ShipState, get_best_roll_plan
+        Direction, HoleState, RollDecision, RollPlan, RollState, RollStep, Ship, ShipState,
+        get_best_roll_plan,
     },
 };
 
 mod best_path_picker;
 mod chart_gen;
 mod hole_info;
-mod roll_calc;
 mod hole_plan_tester;
+mod roll_calc;
 
 fn main() {
     let available_rollers = [
-        Ship {
-            hot: 301_200_000,
-            cold: 201_200_000,
-        },
         // Ship {
-        //     hot: 126_000_000,
-        //     cold: 26_000_000,
+        //     hot: 301_200_000,
+        //     cold: 201_200_000,
         // },
+        Ship {
+            hot: 126_000_000,
+            cold: 26_000_000,
+        },
     ];
     let hole = HoleInfo::from_kg(2_000_000_000);
     let state = RollState {
@@ -32,32 +34,23 @@ fn main() {
         max_size_range: hole.max_range,
     };
     let start_state = HoleState::Full;
-    let plan = get_best_roll_plan(&available_rollers, state, start_state, &minimize_rollout);
+    let priorities = Priorities::new([
+        Quality::ROProbability,
+        Quality::AvgNumPasses,
+        Quality::MaxOut,
+    ])
+    .unwrap();
+    let plan = get_best_roll_plan(&available_rollers, state, start_state, &priorities);
     println!(
-        "{}% {}%",
-        plan.roll_out_probability * 100.,
-        plan.average_num_passes
+        "{}% {} {}",
+        plan.qualities.roll_out_probability * 100.,
+        plan.qualities.average_num_passes,
+        plan.qualities.max_num_out
     );
 
     let mut file = File::create("plan.txt").unwrap();
     file.write_all(generate_flowchart(&plan).as_bytes())
         .unwrap();
-}
-
-fn minimize_rollout(plan1: &RollPlan, plan2: &RollPlan) -> Ordering {
-    match plan1
-        .roll_out_probability
-        .partial_cmp(&plan2.roll_out_probability)
-        .unwrap()
-    {
-        Ordering::Less => Ordering::Greater,
-        Ordering::Greater => Ordering::Less,
-        Ordering::Equal => plan1
-            .average_num_passes
-            .partial_cmp(&plan2.average_num_passes)
-            .unwrap()
-            .reverse(),
-    }
 }
 
 fn generate_flowchart(plan: &RollPlan) -> String {
@@ -83,19 +76,24 @@ fn generate_flowchart_rec(
     chart: &mut ChartGen,
     plan: &RollPlan,
     force_links: bool,
-    memoize: &mut HashMap<usize, Connection>
+    memoize: &mut HashMap<usize, Connection>,
 ) -> Connection {
     let current_id = plan_id(plan);
 
     if let Some(cached) = memoize.get(&current_id) {
-        return cached.clone()
+        return cached.clone();
     }
 
-    const CRIT: &str = "Crit";
-    const SHRINK: &str = "Shrink";
-    const FULL: &str = "Full";
-
-    let RollPlan {decision: RollDecision { crit: crit_o, shrink: shrink_o, full: full_o, .. }, ..} = plan;
+    let RollPlan {
+        decision:
+            RollDecision {
+                crit: crit_o,
+                shrink: shrink_o,
+                full: full_o,
+                ..
+            },
+        ..
+    } = plan;
     let mut options = vec![];
     if let Some(crit) = crit_o {
         options.push((DecisionPath::Crit, crit));
@@ -109,23 +107,32 @@ fn generate_flowchart_rec(
 
     if plan.decision.can_close {
         if options.len() == 0 {
-            return Connection::DirectToClosed
+            return Connection::DirectToClosed;
         } else {
-            chart.add_edge(current_id, chart_gen::Destination::Closed, None, DescisionBranches::Split(vec![DecisionPath::Closed]));
+            chart.add_edge(
+                current_id,
+                chart_gen::Destination::Closed,
+                None,
+                DescisionBranches::Split(vec![DecisionPath::Closed]),
+            );
         }
     }
 
     let mut edges = vec![];
     let no_decision = options.len() == 1 && !force_links && !plan.decision.can_close;
     for (paths, next_step) in options {
-        let (mut down_chain, final_id) = match generate_flowchart_rec(chart, &next_step.next_plan, false, memoize) {
-            Connection::OnlyOption(chain) => chain,
-            Connection::Decision => {
-                add_node(chart, &next_step.next_plan);
-                (HashMap::new(), Destination::Node(plan_id(&next_step.next_plan)))
-            },
-            Connection::DirectToClosed => (HashMap::new(), Destination::Closed)
-        };
+        let (mut down_chain, final_id) =
+            match generate_flowchart_rec(chart, &next_step.next_plan, false, memoize) {
+                Connection::OnlyOption(chain) => chain,
+                Connection::Decision => {
+                    add_node(chart, &next_step.next_plan);
+                    (
+                        HashMap::new(),
+                        Destination::Node(plan_id(&next_step.next_plan)),
+                    )
+                }
+                Connection::DirectToClosed => (HashMap::new(), Destination::Closed),
+            };
         add_to_chain(&mut down_chain, &next_step);
         if no_decision {
             memoize.insert(current_id, Connection::OnlyOption((down_chain, final_id)));
@@ -141,7 +148,7 @@ fn generate_flowchart_rec(
             if edest == &dest && eedge == &edge {
                 match epaths {
                     DescisionBranches::Split(v) => v.push(paths),
-                    DescisionBranches::All => unreachable!()
+                    DescisionBranches::All => unreachable!(),
                 }
                 found = true;
                 break;
@@ -159,13 +166,17 @@ fn generate_flowchart_rec(
     for (final_id, chain, paths) in combined_edges {
         chart.add_edge(current_id, final_id, chain, paths);
     }
-    
+
     memoize.insert(current_id, Connection::Decision);
     Connection::Decision
 }
 
 fn add_to_chain(chain: &mut HashMap<ConnectionPass, u32>, step: &RollStep) {
-    let key = ConnectionPass { ship: step.ship, state: step.ship_state, direction: step.direction };
+    let key = ConnectionPass {
+        ship: step.ship,
+        state: step.ship_state,
+        direction: step.direction,
+    };
     if let Some(option) = chain.get_mut(&key) {
         *option += 1;
     } else {
@@ -173,9 +184,18 @@ fn add_to_chain(chain: &mut HashMap<ConnectionPass, u32>, step: &RollStep) {
     }
 }
 
+const MASS_DIVISOR: Mass = 1000000;
+
 fn plan_to_data(plan: &RollPlan) -> NodeData {
     NodeData {
-        rollout_probability: plan.roll_out_probability,
+        rollout_probability: plan.qualities.roll_out_probability,
+        extra_info: format!(
+            "mass: {}-{}\nmax: {}-{}",
+            plan.mass_range.least / MASS_DIVISOR,
+            plan.mass_range.most / MASS_DIVISOR,
+            plan.max_mass_range.least / MASS_DIVISOR,
+            plan.max_mass_range.most / MASS_DIVISOR
+        ),
     }
 }
 
@@ -188,7 +208,7 @@ fn step_to_text(step: &RollStep, hole_stage: &str) -> String {
         ShipState::Cold => step.ship.cold,
         ShipState::Hot => step.ship.hot,
     };
-    mass /= 1000000;
+    mass /= MASS_DIVISOR;
     format!("{hole_stage}\n{pass} {mass}")
 }
 

@@ -5,5 +5,3 @@ struct HoleData {
     max_mass: Mass,
 }
 
-
-pub fn 
