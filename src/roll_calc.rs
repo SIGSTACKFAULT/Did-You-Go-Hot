@@ -37,7 +37,7 @@ pub struct RollDecision<'a> {
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct RollState {
     pub remaining_mass: MassRange,
-    pub rollers_out: SmallVec<[u16; EFFICIENT_NUM_ROLLERS]>,
+    pub rollers_out: RollersOut,
     pub max_size_range: MassRange,
 }
 
@@ -47,6 +47,61 @@ pub struct RollStep<'a> {
     pub direction: Direction,
     pub ship_state: ShipState,
     pub ship: Ship,
+}
+
+type RollerOutBacking = u64;
+const MAX_NUM_ROLLERS: usize = size_of::<RollerOutBacking>();
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub struct RollersOut(RollerOutBacking);
+
+impl RollersOut {
+    pub fn new() -> Self {
+        Self(0)
+    }
+
+    /// Increments the count for a given ship index (0 to 7)
+    pub fn add(&mut self, ship_index: usize) {
+        debug_assert!(ship_index < MAX_NUM_ROLLERS, "Too many ship types!");
+        let shift = Self::shift(ship_index);
+        let current_count = (self.0 >> shift) & 0xFF;
+
+        // Clear the old byte and insert the new byte
+        self.0 &= !(0xFF << shift);
+        self.0 |= (current_count + 1) << shift;
+    }
+
+    pub fn sub(&mut self, ship_index: usize) {
+        debug_assert!(ship_index < MAX_NUM_ROLLERS, "Too many ship types!");
+        let shift = Self::shift(ship_index);
+        let current_count = (self.0 >> shift) & 0xFF;
+
+        // Clear the old byte and insert the new byte
+        self.0 &= !(0xFF << shift);
+        self.0 |= (current_count + 1) << shift;
+    }
+
+    /// Gets the count for a given ship index
+    pub fn get(&self, ship_index: usize) -> u8 {
+        debug_assert!(ship_index < MAX_NUM_ROLLERS, "ship index out of bounds");
+        ((self.0 >> (ship_index * 8)) & 0xFF) as u8
+    }
+
+    fn shift(ship_index: usize) -> usize {
+        ship_index * 8
+    }
+
+    pub fn num_rollers_out(&self) -> u16 {
+        let mut num = 0;
+        for i in 0..MAX_NUM_ROLLERS {
+            num += self.get(i) as u16;
+        }
+        num
+    }
+
+    pub fn any_out(&self) -> bool {
+        self.num_rollers_out() > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -93,14 +148,18 @@ pub fn get_best_roll_plan<'a>(
     priorities: &Priorities,
     arena: &'a Bump,
 ) -> RollPlan<'a> {
-    RollPlan::clone(&get_best_roll_plan_rec(
+    assert!(available_rollers.len() <= MAX_NUM_ROLLERS);
+    let mut memoization = FxHashMap::default();
+    let out = RollPlan::clone(&get_best_roll_plan_rec(
         available_rollers,
         state,
         priorities,
         Some(starting_state),
-        &mut FxHashMap::default(),
+        &mut memoization,
         arena,
-    ))
+    ));
+    println!("Num explored states = {}", memoization.len());
+    out
 }
 
 pub fn get_best_roll_plan_rec<'a>(
@@ -111,7 +170,7 @@ pub fn get_best_roll_plan_rec<'a>(
     memoization: &mut Memoizer<'a>,
     arena: &'a Bump,
 ) -> &'a RollPlan<'a> {
-    let base_max_num_out = state.rollers_out.iter().sum::<u16>();
+    let base_max_num_out = state.rollers_out.num_rollers_out();
 
     // Fetch memoized best plan if it exists
     if let Some(cached_plan) = get_best_from_memoization(&state, base_max_num_out, memoization) {
@@ -167,7 +226,7 @@ pub fn get_best_roll_plan_rec<'a>(
     let all_possible_states = possible_closed_states + possible_states.iter().sum::<u128>();
 
     // If the hole is closed, the rollout probability is 0 if all rollers are in. Otherwise, it's 1.
-    let closed_roll_out_probability = if state.rollers_out.iter().all(|x| *x == 0) {
+    let closed_roll_out_probability = if state.rollers_out.any_out() {
         0.0
     } else {
         1.0
@@ -382,14 +441,14 @@ fn compute_and_prune_or_add_step<'a>(
 
     let mut minimum_needed_mass_to_avoid_rollout = 0;
     let mut largest_ship: Option<Ship> = None;
-    for (i, num) in path_state.rollers_out.iter().enumerate() {
-        let ship = available_rollers[i];
-        minimum_needed_mass_to_avoid_rollout += ship.minimum_mass() * *num as Mass;
+    for (i, ship) in available_rollers.iter().enumerate() {
+        let num = path_state.rollers_out.get(i);
+        minimum_needed_mass_to_avoid_rollout += ship.minimum_mass() * num as Mass;
 
         largest_ship = match largest_ship {
-            Some(prev) if ship.minimum_mass() > prev.minimum_mass() => Some(ship),
+            Some(prev) if ship.minimum_mass() > prev.minimum_mass() => Some(*ship),
             Some(prev) => Some(prev),
-            None => Some(ship),
+            None => Some(*ship),
         };
     }
     // The hole can have 1 mass left with a single ship out, so remove largest ship and add 1 to avoid rollout
@@ -407,7 +466,7 @@ fn compute_and_prune_or_add_step<'a>(
             0.0
         };
 
-    let num_rollers_out = path_state.rollers_out.iter().sum();
+    let num_rollers_out = path_state.rollers_out.num_rollers_out();
     let minimum_qualities = Qualities {
         max_num_out: num_rollers_out,
         roll_out_probability: minimum_rollout_chance,
@@ -439,7 +498,7 @@ fn compute_and_prune_or_add_step<'a>(
 }
 
 struct PotentialPass {
-    new_out_rollers: SmallVec<[u16; EFFICIENT_NUM_ROLLERS]>,
+    new_out_rollers: RollersOut,
     mass: Mass,
     direction: Direction,
     ship_state: ShipState,
@@ -451,16 +510,16 @@ const PREDICTED_NUM_POTENTIAL_PASSES: usize = (EFFICIENT_NUM_ROLLERS * EFFICIENT
     * EFFICIENT_NUM_SHIP_STATES;
 fn get_steps(
     available_rollers: &[Ship],
-    rollers_out: &SmallVec<[u16; EFFICIENT_NUM_ROLLERS]>,
+    rollers_out: &RollersOut,
 ) -> SmallVec<[PotentialPass; PREDICTED_NUM_POTENTIAL_PASSES]> {
     let mut potential_passes = SmallVec::new();
-    for i in 0..rollers_out.len() {
-        if rollers_out[i] == 0 {
+    for i in 0..available_rollers.len() {
+        if rollers_out.get(i) == 0 {
             continue;
         }
         let mut new_out_rollers = rollers_out.clone();
         let in_ship = available_rollers[i];
-        new_out_rollers[i] -= 1;
+        new_out_rollers.sub(i);
 
         potential_passes.push(PotentialPass {
             new_out_rollers: new_out_rollers.clone(),
@@ -480,7 +539,7 @@ fn get_steps(
 
     for (i, out_ship) in available_rollers.iter().enumerate() {
         let mut new_out_rollers = rollers_out.clone();
-        new_out_rollers[i] += 1;
+        new_out_rollers.add(i);
         potential_passes.push(PotentialPass {
             new_out_rollers: new_out_rollers.clone(),
             mass: out_ship.cold,

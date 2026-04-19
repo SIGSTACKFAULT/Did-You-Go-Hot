@@ -7,8 +7,8 @@ use crate::{
     chart_gen::{ChartGen, ConnectionPass, DecisionPath, DescisionBranches, Destination, NodeData},
     hole_info::{HoleInfo, Mass},
     roll_calc::{
-        Direction, HoleState, RollDecision, RollPlan, RollState, RollStep, Ship, ShipState,
-        get_best_roll_plan,
+        Direction, HoleState, RollDecision, RollPlan, RollState, RollStep, RollersOut, Ship,
+        ShipState, get_best_roll_plan,
     },
 };
 
@@ -30,7 +30,7 @@ fn main() {
         },
     ];
 
-    let rollers_out = (0..(available_rollers.len())).map(|_| 0).collect();
+    let rollers_out = RollersOut::new();
     let hole = HoleInfo::from_kg(3_000_000_000);
     let state = RollState {
         remaining_mass: hole.full_mass_range(),
@@ -39,9 +39,9 @@ fn main() {
     };
     let start_state = HoleState::Full;
     let priorities = Priorities::new(vec![
-        Quality::MaxOut,
         Quality::ROProbability,
         Quality::AvgNumPasses,
+        Quality::MaxOut,
     ])
     .unwrap();
     let arena = Bump::new();
@@ -53,9 +53,9 @@ fn main() {
         plan.qualities.max_num_out
     );
 
-    // let mut file = File::create("plan.txt").unwrap();
-    // file.write_all(generate_flowchart(&plan).as_bytes())
-    //     .unwrap();
+    let mut file = File::create("plan.txt").unwrap();
+    file.write_all(generate_flowchart(&plan).as_bytes())
+        .unwrap();
 }
 
 fn generate_flowchart(plan: &RollPlan) -> String {
@@ -202,19 +202,6 @@ fn plan_to_data(plan: &RollPlan) -> NodeData {
             plan.max_mass_range.most / MASS_DIVISOR
         ),
     }
-}
-
-fn step_to_text(step: &RollStep, hole_stage: &str) -> String {
-    let pass = match step.direction {
-        Direction::In => "in",
-        Direction::Out => "out",
-    };
-    let mut mass = match step.ship_state {
-        ShipState::Cold => step.ship.cold,
-        ShipState::Hot => step.ship.hot,
-    };
-    mass /= MASS_DIVISOR;
-    format!("{hole_stage}\n{pass} {mass}")
 }
 
 fn plan_id(plan: &RollPlan) -> usize {
