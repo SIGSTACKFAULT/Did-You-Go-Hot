@@ -18,6 +18,10 @@ const EFFICIENT_NUM_SHIP_STATES: usize = 2;
 
 type Memoizer<'a> = FxHashMap<RollState, SmallVec<[&'a RollPlan<'a>; EFFICIENT_NUM_CACHED_STEPS]>>;
 
+struct StaticData {
+    max_single_jump_mass: Mass,
+}
+
 #[derive(Debug, Clone)]
 pub struct RollPlan<'a> {
     pub qualities: Qualities,
@@ -39,6 +43,7 @@ pub struct RollState {
     pub remaining_mass: MassRange,
     pub rollers_out: RollersOut,
     pub max_size_range: MassRange,
+    pub highest_hole_state: HoleState,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +121,7 @@ pub enum ShipState {
     Cold,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum HoleState {
     Full,
     Shrink,
@@ -154,6 +159,16 @@ pub fn get_best_roll_plan<'a>(
 ) -> RollPlan<'a> {
     assert!(available_rollers.len() <= MAX_NUM_ROLLERS);
     let mut memoization = FxHashMap::default();
+
+    let max_single_jump_mass = available_rollers
+        .iter()
+        .map(|s| s.maximum_mass()) // Assuming your ship has cold/hot mass properties
+        .max()
+        .unwrap() as Mass;
+    let static_data = StaticData {
+        max_single_jump_mass,
+    };
+
     let out = RollPlan::clone(&get_best_roll_plan_rec(
         available_rollers,
         state,
@@ -161,6 +176,7 @@ pub fn get_best_roll_plan<'a>(
         Some(starting_state),
         &mut memoization,
         arena,
+        &static_data,
     ));
     println!("Num explored states = {}", memoization.len());
     out
@@ -173,6 +189,7 @@ pub fn get_best_roll_plan_rec<'a>(
     assume_state: Option<HoleState>,
     memoization: &mut Memoizer<'a>,
     arena: &'a Bump,
+    static_data: &StaticData,
 ) -> &'a RollPlan<'a> {
     let base_max_num_out = state.rollers_out.num_rollers_out();
 
@@ -191,6 +208,16 @@ pub fn get_best_roll_plan_rec<'a>(
         array::from_fn(|i| overlap(&max_mass_ranges[i], &state.remaining_mass));
     let mass_range_for_closed = overlap(&closed_range(), &state.remaining_mass);
 
+    let mut should_ignore_state = [false; 3];
+    match state.highest_hole_state {
+        HoleState::Crit => {
+            should_ignore_state[1] = true;
+            should_ignore_state[2] = true;
+        }
+        HoleState::Shrink => should_ignore_state[2] = true,
+        HoleState::Full => (),
+    }
+
     // If we are assuming a specific state (likely because the user knows the hole state) make all other possibilities not possible
     if let Some(starting_state) = assume_state {
         // Cold because should only ever happen in the first call.
@@ -202,8 +229,14 @@ pub fn get_best_roll_plan_rec<'a>(
         };
         for i in 0..3 {
             if i != stay_full {
-                mass_ranges[i] = EMPTY_MR;
+                should_ignore_state[i] = true;
             }
+        }
+    }
+
+    for (i, should_ignore) in should_ignore_state.iter().enumerate() {
+        if *should_ignore {
+            mass_ranges[i] = EMPTY_MR;
         }
     }
 
@@ -230,7 +263,7 @@ pub fn get_best_roll_plan_rec<'a>(
     let all_possible_states = possible_closed_states + possible_states.iter().sum::<u128>();
 
     // If the hole is closed, the rollout probability is 0 if all rollers are in. Otherwise, it's 1.
-    let closed_roll_out_probability = if !state.rollers_out.any_out() {
+    let closed_roll_out_probability_raw = if !state.rollers_out.any_out() {
         0.0
     } else {
         1.0
@@ -240,7 +273,7 @@ pub fn get_best_roll_plan_rec<'a>(
         return arena.alloc(RollPlan {
             qualities: Qualities {
                 max_num_out: base_max_num_out,
-                roll_out_probability: closed_roll_out_probability,
+                roll_out_probability: closed_roll_out_probability_raw,
                 average_num_passes: 0.0,
             },
             decision: RollDecision {
@@ -279,6 +312,7 @@ pub fn get_best_roll_plan_rec<'a>(
             &priorities,
             memoization,
             arena,
+            static_data,
         );
     }
 
@@ -295,11 +329,16 @@ pub fn get_best_roll_plan_rec<'a>(
                 &priorities,
                 memoization,
                 arena,
+                static_data,
             );
         }
     }
 
     let BestOptions { best_paths, splits } = best_paths.best();
+
+    let closed_probability = geometric_probability(possible_closed_states, all_possible_states);
+    let probabilities: [f64; 3] =
+        array::from_fn(|i| geometric_probability(possible_states[i], all_possible_states));
 
     let mut splits = splits.into_iter();
     let paths = best_paths.into_iter();
@@ -312,13 +351,12 @@ pub fn get_best_roll_plan_rec<'a>(
         end = splits.next();
 
         let plan = create_roll_plan(
-            closed_roll_out_probability,
-            possible_closed_states,
-            all_possible_states,
             steps,
             &state,
-            possible_states,
             base_max_num_out,
+            closed_probability * closed_roll_out_probability_raw,
+            probabilities,
+            possible_closed_states != 0,
             arena,
         );
         // When end is None the last one just has to be the worst case.
@@ -353,13 +391,12 @@ fn get_best_plan_from_cached<'a>(
 }
 
 fn create_roll_plan<'a>(
-    closed_roll_out_probability: f64,
-    possible_closed_states: u128,
-    all_possible_states: u128,
     steps: [Option<RollStep<'a>>; 3],
     state: &RollState,
-    possible_states: [u128; 3],
     mut min_max_num_out: u16,
+    closed_roll_out_probability: f64,
+    probabilities: [f64; 3],
+    can_close: bool,
     arena: &'a Bump,
 ) -> &'a mut RollPlan<'a> {
     let mut steps = steps.into_iter();
@@ -387,11 +424,7 @@ fn create_roll_plan<'a>(
         }
     });
 
-    let closed_probability = geometric_probability(possible_closed_states, all_possible_states);
-    let probabilities: [f64; 3] =
-        array::from_fn(|i| geometric_probability(possible_states[i], all_possible_states));
-
-    let roll_out_probability = closed_probability * closed_roll_out_probability
+    let roll_out_probability = closed_roll_out_probability
         + probabilities[0] * rollout_probabilities[0]
         + probabilities[1] * rollout_probabilities[1]
         + probabilities[2] * rollout_probabilities[2];
@@ -416,7 +449,7 @@ fn create_roll_plan<'a>(
             average_num_passes,
         },
         decision: RollDecision {
-            can_close: possible_closed_states != 0,
+            can_close,
             crit,
             shrink,
             full,
@@ -436,14 +469,16 @@ fn compute_and_prune_or_add_step<'a>(
     priorities: &Priorities,
     memoization: &mut Memoizer<'a>,
     arena: &'a Bump,
+    static_data: &StaticData,
 ) {
     let path_state = RollState {
         remaining_mass: mass_range - pass.mass,
         rollers_out: pass.new_out_rollers,
         max_size_range,
+        highest_hole_state: hole_state,
     };
 
-    let minimum_qualities = minimum_possible_qualities(available_rollers, &path_state);
+    let minimum_qualities = minimum_possible_qualities(available_rollers, &path_state, static_data);
 
     if best_paths.should_prune(hole_state, &minimum_qualities) {
         return;
@@ -456,6 +491,7 @@ fn compute_and_prune_or_add_step<'a>(
         None,
         memoization,
         arena,
+        static_data,
     );
 
     best_paths.suggest(
@@ -469,7 +505,11 @@ fn compute_and_prune_or_add_step<'a>(
     );
 }
 
-fn minimum_possible_qualities(available_rollers: &[Ship], path_state: &RollState) -> Qualities {
+fn minimum_possible_qualities(
+    available_rollers: &[Ship],
+    path_state: &RollState,
+    static_data: &StaticData,
+) -> Qualities {
     let mut minimum_mass_needed_to_go_though_without_closing = 0;
     let mut max_return_mass = 0;
     let mut largest_ship: Option<Ship> = None;
@@ -507,12 +547,6 @@ fn minimum_possible_qualities(available_rollers: &[Ship], path_state: &RollState
     let num_rollers_out = path_state.rollers_out.num_rollers_out();
 
     let mut minimum_number_passes = num_rollers_out as f64;
-    // Find the absolute largest mass we can put on the hole in a single jump
-    let max_single_jump_mass = available_rollers
-        .iter()
-        .map(|s| s.maximum_mass()) // Assuming your ship has cold/hot mass properties
-        .max()
-        .unwrap_or(1) as Mass;
 
     if max_return_mass < path_state.remaining_mass.least {
         // Even if everyone currently out returns Hot, the hole won't close.
@@ -520,7 +554,8 @@ fn minimum_possible_qualities(available_rollers: &[Ship], path_state: &RollState
 
         // Calculate the absolute minimum number of jumps required to clear the deficit
         // using the largest possible ship
-        let required_extra_jumps = (mass_deficit as f64 / max_single_jump_mass as f64).ceil();
+        let required_extra_jumps =
+            (mass_deficit as f64 / static_data.max_single_jump_mass as f64).ceil();
 
         minimum_number_passes += required_extra_jumps;
     } else if num_rollers_out == 0 && path_state.remaining_mass.least > 0 {
