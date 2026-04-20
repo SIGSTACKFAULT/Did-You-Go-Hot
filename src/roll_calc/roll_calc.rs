@@ -139,6 +139,10 @@ impl Ship {
     pub fn minimum_mass(&self) -> Mass {
         self.cold
     }
+
+    pub fn maximum_mass(&self) -> Mass {
+        self.hot
+    }
 }
 
 pub fn get_best_roll_plan<'a>(
@@ -439,48 +443,7 @@ fn compute_and_prune_or_add_step<'a>(
         max_size_range,
     };
 
-    let mut minimum_mass_needed_to_go_though_without_closing = 0;
-    let mut largest_ship: Option<Ship> = None;
-    for (i, ship) in available_rollers.iter().enumerate() {
-        let num = path_state.rollers_out.get(i);
-        minimum_mass_needed_to_go_though_without_closing += ship.minimum_mass() * num as Mass;
-
-        if num == 0 {
-            continue;
-        }
-
-        largest_ship = match largest_ship {
-            Some(prev) if ship.minimum_mass() > prev.minimum_mass() => Some(*ship),
-            Some(prev) => Some(prev),
-            None => Some(*ship),
-        };
-    }
-    if let Some(ship) = largest_ship {
-        minimum_mass_needed_to_go_though_without_closing -= ship.minimum_mass();
-    }
-
-    let mut minimum_rollout_chance = if minimum_mass_needed_to_go_though_without_closing
-        >= path_state.remaining_mass.most
-    {
-        1.0
-    } else if minimum_mass_needed_to_go_though_without_closing >= path_state.remaining_mass.least {
-        // we know for sure a rollout will happen, but we do not know how likely it is.
-        // Use minimum value so that its worse than 0, but not 1.0.
-        EPSILON
-    } else {
-        0.0
-    };
-
-    if !path_state.rollers_out.any_out() {
-        minimum_rollout_chance = 0.0;
-    }
-
-    let num_rollers_out = path_state.rollers_out.num_rollers_out();
-    let minimum_qualities = Qualities {
-        max_num_out: num_rollers_out,
-        roll_out_probability: minimum_rollout_chance,
-        average_num_passes: num_rollers_out as f64,
-    };
+    let minimum_qualities = minimum_possible_qualities(available_rollers, &path_state);
 
     if best_paths.should_prune(hole_state, &minimum_qualities) {
         return;
@@ -504,6 +467,72 @@ fn compute_and_prune_or_add_step<'a>(
         },
         hole_state,
     );
+}
+
+fn minimum_possible_qualities(available_rollers: &[Ship], path_state: &RollState) -> Qualities {
+    let mut minimum_mass_needed_to_go_though_without_closing = 0;
+    let mut max_return_mass = 0;
+    let mut largest_ship: Option<Ship> = None;
+    for (i, ship) in available_rollers.iter().enumerate() {
+        let num = path_state.rollers_out.get(i);
+        minimum_mass_needed_to_go_though_without_closing += ship.minimum_mass() * num as Mass;
+        max_return_mass += ship.maximum_mass() * num as Mass;
+
+        if num == 0 {
+            continue;
+        }
+
+        largest_ship = match largest_ship {
+            Some(prev) if ship.minimum_mass() > prev.minimum_mass() => Some(*ship),
+            Some(prev) => Some(prev),
+            None => Some(*ship),
+        };
+    }
+    if let Some(ship) = largest_ship {
+        minimum_mass_needed_to_go_though_without_closing -= ship.minimum_mass();
+    }
+
+    let minimum_rollout_chance = if !path_state.rollers_out.any_out() {
+        0.0
+    } else if minimum_mass_needed_to_go_though_without_closing >= path_state.remaining_mass.most {
+        1.0
+    } else if minimum_mass_needed_to_go_though_without_closing >= path_state.remaining_mass.least {
+        // we know for sure a rollout will happen, but we do not know how likely it is.
+        // Use minimum value so that its worse than 0, but not 1.0.
+        EPSILON
+    } else {
+        0.0
+    };
+
+    let num_rollers_out = path_state.rollers_out.num_rollers_out();
+
+    let mut minimum_number_passes = num_rollers_out as f64;
+    // Find the absolute largest mass we can put on the hole in a single jump
+    let max_single_jump_mass = available_rollers
+        .iter()
+        .map(|s| s.maximum_mass()) // Assuming your ship has cold/hot mass properties
+        .max()
+        .unwrap_or(1) as Mass;
+
+    if max_return_mass < path_state.remaining_mass.least {
+        // Even if everyone currently out returns Hot, the hole won't close.
+        let mass_deficit = path_state.remaining_mass.least - max_return_mass;
+
+        // Calculate the absolute minimum number of jumps required to clear the deficit
+        // using the largest possible ship
+        let required_extra_jumps = (mass_deficit as f64 / max_single_jump_mass as f64).ceil();
+
+        minimum_number_passes += required_extra_jumps;
+    } else if num_rollers_out == 0 && path_state.remaining_mass.least > 0 {
+        // No ships out, no deficit, but hole is open. Must go out at least
+        minimum_number_passes = 1.0;
+    }
+
+    Qualities {
+        max_num_out: num_rollers_out,
+        roll_out_probability: minimum_rollout_chance,
+        average_num_passes: minimum_number_passes,
+    }
 }
 
 struct PotentialPass {
