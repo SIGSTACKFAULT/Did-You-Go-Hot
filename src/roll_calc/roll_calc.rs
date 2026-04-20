@@ -439,11 +439,11 @@ fn compute_and_prune_or_add_step<'a>(
         max_size_range,
     };
 
-    let mut minimum_needed_mass_to_avoid_rollout = 0;
+    let mut minimum_mass_needed_to_go_though_without_closing = 0;
     let mut largest_ship: Option<Ship> = None;
     for (i, ship) in available_rollers.iter().enumerate() {
         let num = path_state.rollers_out.get(i);
-        minimum_needed_mass_to_avoid_rollout += ship.minimum_mass() * num as Mass;
+        minimum_mass_needed_to_go_though_without_closing += ship.minimum_mass() * num as Mass;
 
         if num == 0 {
             continue;
@@ -455,22 +455,25 @@ fn compute_and_prune_or_add_step<'a>(
             None => Some(*ship),
         };
     }
-    // The hole can have 1 mass left with a single ship out, so remove largest ship and add 1 to avoid rollout
     if let Some(ship) = largest_ship {
-        minimum_needed_mass_to_avoid_rollout -= ship.minimum_mass();
-        minimum_needed_mass_to_avoid_rollout += 1;
+        minimum_mass_needed_to_go_though_without_closing -= ship.minimum_mass();
     }
 
-    let minimum_rollout_chance =
-        if minimum_needed_mass_to_avoid_rollout >= path_state.remaining_mass.least {
-            // we know for sure a rollout will happen, but we do not know how likely it is.
-            // Use minimum value so that its worse than 0, but not 1.0.
-            EPSILON
-        } else if minimum_needed_mass_to_avoid_rollout >= path_state.remaining_mass.most {
-            1.0
-        } else {
-            0.0
-        };
+    let mut minimum_rollout_chance = if minimum_mass_needed_to_go_though_without_closing
+        >= path_state.remaining_mass.most
+    {
+        1.0
+    } else if minimum_mass_needed_to_go_though_without_closing >= path_state.remaining_mass.least {
+        // we know for sure a rollout will happen, but we do not know how likely it is.
+        // Use minimum value so that its worse than 0, but not 1.0.
+        EPSILON
+    } else {
+        0.0
+    };
+
+    if !path_state.rollers_out.any_out() {
+        minimum_rollout_chance = 0.0;
+    }
 
     let num_rollers_out = path_state.rollers_out.num_rollers_out();
     let minimum_qualities = Qualities {
