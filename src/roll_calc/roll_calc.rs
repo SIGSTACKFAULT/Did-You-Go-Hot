@@ -445,6 +445,10 @@ fn compute_and_prune_or_add_step<'a>(
         let num = path_state.rollers_out.get(i);
         minimum_needed_mass_to_avoid_rollout += ship.minimum_mass() * num as Mass;
 
+        if num == 0 {
+            continue;
+        }
+
         largest_ship = match largest_ship {
             Some(prev) if ship.minimum_mass() > prev.minimum_mass() => Some(*ship),
             Some(prev) => Some(prev),
@@ -458,10 +462,12 @@ fn compute_and_prune_or_add_step<'a>(
     }
 
     let minimum_rollout_chance =
-        if minimum_needed_mass_to_avoid_rollout >= path_state.remaining_mass.most {
+        if minimum_needed_mass_to_avoid_rollout >= path_state.remaining_mass.least {
             // we know for sure a rollout will happen, but we do not know how likely it is.
             // Use minimum value so that its worse than 0, but not 1.0.
             EPSILON
+        } else if minimum_needed_mass_to_avoid_rollout >= path_state.remaining_mass.most {
+            1.0
         } else {
             0.0
         };
