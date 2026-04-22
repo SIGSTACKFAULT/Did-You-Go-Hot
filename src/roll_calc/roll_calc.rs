@@ -41,9 +41,10 @@ pub struct RollDecision<'a> {
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct RollState {
     pub remaining_mass: MassRange,
-    pub rollers_out: RollersOut,
+    pub rollers_out: RollersUsed,
     pub max_size_range: MassRange,
     pub highest_hole_state: HoleState,
+    pub used_ships: RollersUsed,
 }
 
 #[derive(Debug, Clone)]
@@ -58,9 +59,9 @@ type RollerOutBacking = u64;
 const MAX_NUM_ROLLERS: usize = size_of::<RollerOutBacking>();
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct RollersOut(RollerOutBacking);
+pub struct RollersUsed(RollerOutBacking);
 
-impl RollersOut {
+impl RollersUsed {
     pub fn new() -> Self {
         Self(0)
     }
@@ -140,6 +141,12 @@ pub struct Ship {
     pub cold: Mass,
 }
 
+pub struct AvailabileShips {
+    pub ship: Ship,
+    pub max_num_out: u8,
+    pub max_used: u8,
+}
+
 impl Ship {
     pub fn minimum_mass(&self) -> Mass {
         self.cold
@@ -151,7 +158,7 @@ impl Ship {
 }
 
 pub fn get_best_roll_plan<'a>(
-    available_rollers: &[Ship],
+    available_rollers: &[AvailabileShips],
     state: RollState,
     starting_state: HoleState,
     priorities: &Priorities,
@@ -162,7 +169,7 @@ pub fn get_best_roll_plan<'a>(
 
     let max_single_jump_mass = available_rollers
         .iter()
-        .map(|s| s.maximum_mass()) // Assuming your ship has cold/hot mass properties
+        .map(|s| s.ship.maximum_mass()) // Assuming your ship has cold/hot mass properties
         .max()
         .unwrap() as Mass;
     let static_data = StaticData {
@@ -182,8 +189,8 @@ pub fn get_best_roll_plan<'a>(
     out
 }
 
-pub fn get_best_roll_plan_rec<'a>(
-    available_rollers: &[Ship],
+fn get_best_roll_plan_rec<'a>(
+    available_rollers: &[AvailabileShips],
     state: RollState,
     priorities: &Priorities,
     assume_state: Option<HoleState>,
@@ -290,7 +297,7 @@ pub fn get_best_roll_plan_rec<'a>(
     let cared_about_states = array::from_fn(|i| possible_states[i] > 0);
     let mut best_paths = PathPicker::new(priorities, cared_about_states);
 
-    let mut steps = get_steps(available_rollers, &state.rollers_out).into_iter();
+    let mut steps = get_steps(available_rollers, &state.rollers_out, &state.used_ships).into_iter();
 
     let first_step = steps.next().unwrap();
 
@@ -463,7 +470,7 @@ fn compute_and_prune_or_add_step<'a>(
     pass: &PotentialPass,
     best_paths: &mut PathPicker<'a, '_>,
     hole_state: HoleState,
-    available_rollers: &[Ship],
+    available_rollers: &[AvailabileShips],
     mass_range: MassRange,
     max_size_range: MassRange,
     priorities: &Priorities,
@@ -476,6 +483,7 @@ fn compute_and_prune_or_add_step<'a>(
         rollers_out: pass.new_out_rollers,
         max_size_range,
         highest_hole_state: hole_state,
+        used_ships: pass.new_used_ships,
     };
 
     let minimum_qualities = minimum_possible_qualities(available_rollers, &path_state, static_data);
@@ -506,7 +514,7 @@ fn compute_and_prune_or_add_step<'a>(
 }
 
 fn minimum_possible_qualities(
-    available_rollers: &[Ship],
+    available_rollers: &[AvailabileShips],
     path_state: &RollState,
     static_data: &StaticData,
 ) -> Qualities {
@@ -515,17 +523,17 @@ fn minimum_possible_qualities(
     let mut largest_ship: Option<Ship> = None;
     for (i, ship) in available_rollers.iter().enumerate() {
         let num = path_state.rollers_out.get(i);
-        minimum_mass_needed_to_go_though_without_closing += ship.minimum_mass() * num as Mass;
-        max_return_mass += ship.maximum_mass() * num as Mass;
+        minimum_mass_needed_to_go_though_without_closing += ship.ship.minimum_mass() * num as Mass;
+        max_return_mass += ship.ship.maximum_mass() * num as Mass;
 
         if num == 0 {
             continue;
         }
 
         largest_ship = match largest_ship {
-            Some(prev) if ship.minimum_mass() > prev.minimum_mass() => Some(*ship),
+            Some(prev) if ship.ship.minimum_mass() > prev.minimum_mass() => Some(ship.ship),
             Some(prev) => Some(prev),
-            None => Some(*ship),
+            None => Some(ship.ship),
         };
     }
     if let Some(ship) = largest_ship {
@@ -537,9 +545,14 @@ fn minimum_possible_qualities(
     } else if minimum_mass_needed_to_go_though_without_closing >= path_state.remaining_mass.most {
         1.0
     } else if minimum_mass_needed_to_go_though_without_closing >= path_state.remaining_mass.least {
-        // we know for sure a rollout will happen, but we do not know how likely it is.
-        // Use minimum value so that its worse than 0, but not 1.0.
-        EPSILON
+        // Might need to restrict to only crit holes because this calc may be slightly inacurate since
+        // if not crit you may get info for when it does go crit/shrink
+        let range_after_all_in =
+            path_state.remaining_mass - minimum_mass_needed_to_go_though_without_closing;
+        let num_rollout_masses = range_after_all_in.least.abs() + 1;
+        let rollout_probability =
+            num_rollout_masses as f64 / (range_after_all_in.most + num_rollout_masses) as f64;
+        rollout_probability.max(EPSILON)
     } else {
         0.0
     };
@@ -571,19 +584,21 @@ fn minimum_possible_qualities(
 }
 
 struct PotentialPass {
-    new_out_rollers: RollersOut,
+    new_out_rollers: RollersUsed,
     mass: Mass,
     direction: Direction,
     ship_state: ShipState,
     ship: Ship,
+    new_used_ships: RollersUsed,
 }
 
 const PREDICTED_NUM_POTENTIAL_PASSES: usize = (EFFICIENT_NUM_ROLLERS * EFFICIENT_MAX_NUM_OUT
     + EFFICIENT_NUM_AVAILABLE_ROLLERS)
     * EFFICIENT_NUM_SHIP_STATES;
 fn get_steps(
-    available_rollers: &[Ship],
-    rollers_out: &RollersOut,
+    available_rollers: &[AvailabileShips],
+    rollers_out: &RollersUsed,
+    used_rollers: &RollersUsed,
 ) -> SmallVec<[PotentialPass; PREDICTED_NUM_POTENTIAL_PASSES]> {
     let mut potential_passes = SmallVec::new();
     for i in 0..available_rollers.len() {
@@ -591,7 +606,7 @@ fn get_steps(
             continue;
         }
         let mut new_out_rollers = *rollers_out;
-        let in_ship = available_rollers[i];
+        let in_ship = available_rollers[i].ship;
         new_out_rollers.sub(i);
 
         potential_passes.push(PotentialPass {
@@ -600,6 +615,7 @@ fn get_steps(
             direction: Direction::In,
             ship_state: ShipState::Cold,
             ship: in_ship,
+            new_used_ships: *used_rollers,
         });
         potential_passes.push(PotentialPass {
             new_out_rollers: new_out_rollers,
@@ -607,25 +623,34 @@ fn get_steps(
             direction: Direction::In,
             ship_state: ShipState::Hot,
             ship: in_ship,
+            new_used_ships: *used_rollers,
         });
     }
 
     for (i, out_ship) in available_rollers.iter().enumerate() {
+        let out_ship = out_ship.ship;
         let mut new_out_rollers = *rollers_out;
         new_out_rollers.add(i);
+        let mut new_used_rollers = *used_rollers;
+        new_used_rollers.add(i);
+        if new_used_rollers.get(i) > available_rollers[i].max_used {
+            continue;
+        }
         potential_passes.push(PotentialPass {
             new_out_rollers: new_out_rollers,
             mass: out_ship.cold,
             direction: Direction::Out,
             ship_state: ShipState::Cold,
-            ship: *out_ship,
+            ship: out_ship,
+            new_used_ships: new_used_rollers,
         });
         potential_passes.push(PotentialPass {
             new_out_rollers: new_out_rollers,
             mass: out_ship.hot,
             direction: Direction::Out,
             ship_state: ShipState::Hot,
-            ship: *out_ship,
+            ship: out_ship,
+            new_used_ships: new_used_rollers,
         })
     }
 

@@ -7,7 +7,7 @@ use crate::{
     chart_gen::{ChartGen, ConnectionPass, DecisionPath, DescisionBranches, Destination, NodeData},
     hole_info::{HoleInfo, Mass},
     roll_calc::{
-        HoleState, RollDecision, RollPlan, RollState, RollStep, RollersOut, Ship,
+        AvailabileShips, HoleState, RollDecision, RollPlan, RollState, RollStep, RollersUsed, Ship,
         get_best_roll_plan, graph_builder::generate_flowchart,
     },
 };
@@ -20,22 +20,32 @@ mod roll_calc;
 
 fn main() {
     let available_rollers = [
-        Ship {
-            hot: 301_200_000,
-            cold: 201_200_000,
+        AvailabileShips {
+            ship: Ship {
+                hot: 301_200_000,
+                cold: 201_200_000,
+            },
+            max_num_out: 3,
+            max_used: 3,
         },
-        Ship {
-            hot: 126_000_000,
-            cold: 26_000_000,
+        AvailabileShips {
+            ship: Ship {
+                hot: 126_000_000,
+                cold: 26_000_000,
+            },
+            max_num_out: 10,
+            max_used: 98,
         },
     ];
 
-    let rollers_out = RollersOut::new();
-    let hole = HoleInfo::from_kg(2_000_000_000);
+    let rollers_out = RollersUsed::new();
+    let hole = HoleInfo::from_kg(3_000_000_000);
     let state = RollState {
         remaining_mass: hole.full_mass_range(),
         rollers_out,
         max_size_range: hole.max_range,
+        highest_hole_state: HoleState::Full,
+        used_ships: RollersUsed::new(),
     };
     let start_state = HoleState::Full;
     let priorities = Priorities::new(vec![
@@ -45,6 +55,8 @@ fn main() {
     ])
     .unwrap();
     let arena = Bump::new();
+    let num_gigabytes = 16;
+    arena.set_allocation_limit(Some(num_gigabytes * 1024 * 1024 * 1024));
     let plan = get_best_roll_plan(&available_rollers, state, start_state, &priorities, &arena);
     println!(
         "{}% {} {}",

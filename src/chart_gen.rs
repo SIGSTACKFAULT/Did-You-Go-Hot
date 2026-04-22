@@ -1,7 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::{roll_calc::{Direction, Ship, ShipState}};
-
+use crate::roll_calc::{Direction, Ship, ShipState};
 
 #[derive(Debug, PartialEq)]
 pub struct NodeData {
@@ -12,7 +11,7 @@ pub struct NodeData {
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 pub enum Destination {
     Closed,
-    Node(usize)
+    Node(usize),
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -30,15 +29,16 @@ pub enum DecisionPath {
     Full,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub enum DescisionBranches {
     All,
-    Split(Vec<DecisionPath>)
+    Split(Vec<DecisionPath>),
 }
 
 pub struct ChartGen {
     ids: HashMap<usize, NodeData>,
-    connections: HashMap<(usize, Destination, DescisionBranches), Option<HashMap<ConnectionPass, u32>>>,
+    connections:
+        HashMap<(usize, Destination, DescisionBranches), Option<HashMap<ConnectionPass, u32>>>,
 }
 
 impl ChartGen {
@@ -57,9 +57,15 @@ impl ChartGen {
         self.ids.insert(id, data);
     }
 
-    pub fn add_edge(&mut self, from: usize, to: Destination, data: Option<HashMap<ConnectionPass, u32>>, branches: DescisionBranches) {
+    pub fn add_edge(
+        &mut self,
+        from: usize,
+        to: Destination,
+        data: Option<HashMap<ConnectionPass, u32>>,
+        branches: DescisionBranches,
+    ) {
         let key = (from, to, branches);
-        if let Some(e) = self.connections.insert(key, data ) {
+        if let Some(e) = self.connections.insert(key, data) {
             panic!("{:?}", e);
         }
     }
@@ -67,7 +73,11 @@ impl ChartGen {
     pub fn to_text_chart(&self) -> String {
         let mut chart = "---\ntitle: Roll Plan\n---\nflowchart TD\n".to_string();
         for (id, data) in &self.ids {
-            chart.push_str(&format!("{id}[{}%\n{}]\n", data.rollout_probability * 100.0, data.extra_info));
+            chart.push_str(&format!(
+                "{id}[{}%\n{}]\n",
+                data.rollout_probability * 100.0,
+                data.extra_info
+            ));
         }
 
         let mut unique_id = -1;
@@ -90,11 +100,35 @@ impl ChartGen {
                     chart.push_str("\n");
                 }
             }
-            
+
             chart.push_str(&format!("| {}\n", dest_to_text(to, &mut unique_id)));
         }
-        
+
         chart
+    }
+
+    pub fn head_node(&self) -> Option<usize> {
+        let mut found = HashSet::new();
+        for (_, to, _) in self.connections.keys() {
+            if let Destination::Node(node) = to {
+                found.insert(*node);
+            }
+        }
+        let head = self.ids.keys().find(|x| !found.contains(x));
+        head.copied()
+    }
+
+    pub fn decisions(
+        &self,
+        node: usize,
+    ) -> HashMap<DescisionBranches, Option<HashMap<ConnectionPass, u32>>> {
+        let mut out = HashMap::new();
+        for ((from, _, decision), passes) in &self.connections {
+            if *from == node {
+                out.insert(decision.clone(), passes.clone());
+            }
+        }
+        out
     }
 }
 
@@ -104,8 +138,8 @@ fn dest_to_text(dest: &Destination, unique_id: &mut i32) -> String {
             let out = format!("{unique_id}[Closed]");
             *unique_id -= 1;
             out
-        },
-        Destination::Node(n) => format!("{n}")
+        }
+        Destination::Node(n) => format!("{n}"),
     }
 }
 
