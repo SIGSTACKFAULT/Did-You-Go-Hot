@@ -7,7 +7,9 @@ use tinyvec::ArrayVec;
 
 use crate::{
     best_path_picker::{BestOptions, PathPicker, Priorities, Qualities},
+    chart_gen::RollingChart,
     hole_info::{EMPTY_MR, Mass, MassRange, mr},
+    roll_calc::graph_builder::generate_roll_chart,
 };
 
 const EFFICIENT_NUM_ROLLERS: usize = 2;
@@ -157,14 +159,16 @@ impl Ship {
     }
 }
 
-pub fn get_best_roll_plan<'a>(
+pub fn get_best_roll_chart(
     available_rollers: &[AvailabileShips],
     state: RollState,
     starting_state: HoleState,
     priorities: &Priorities,
-    arena: &'a Bump,
-) -> RollPlan<'a> {
+    max_memory: Option<usize>,
+) -> (RollingChart, Qualities) {
     assert!(available_rollers.len() <= MAX_NUM_ROLLERS);
+    let arena = Bump::new();
+    arena.set_allocation_limit(max_memory);
     let mut memoization = FxHashMap::default();
 
     let max_single_jump_mass = available_rollers
@@ -176,17 +180,18 @@ pub fn get_best_roll_plan<'a>(
         max_single_jump_mass,
     };
 
-    let out = RollPlan::clone(&get_best_roll_plan_rec(
+    let plan = RollPlan::clone(&get_best_roll_plan_rec(
         available_rollers,
         state,
         priorities,
         Some(starting_state),
         &mut memoization,
-        arena,
+        &arena,
         &static_data,
     ));
     println!("Num explored states = {}", memoization.len());
-    out
+
+    (generate_roll_chart(&plan), plan.qualities)
 }
 
 fn get_best_roll_plan_rec<'a>(

@@ -4,11 +4,11 @@ use bumpalo::Bump;
 
 use crate::{
     best_path_picker::{Priorities, Quality},
-    chart_gen::{ChartGen, ConnectionPass, DecisionPath, DescisionBranches, Destination, NodeData},
+    chart_gen::{ConnectionPass, Destination, NodeData},
     hole_info::{HoleInfo, Mass},
     roll_calc::{
         AvailabileShips, HoleState, RollDecision, RollPlan, RollState, RollStep, RollersUsed, Ship,
-        get_best_roll_plan, graph_builder::generate_flowchart,
+        get_best_roll_chart,
     },
 };
 
@@ -25,17 +25,17 @@ fn main() {
                 hot: 301_200_000,
                 cold: 201_200_000,
             },
-            max_num_out: 3,
-            max_used: 3,
+            max_num_out: 1,
+            max_used: 99,
         },
-        AvailabileShips {
-            ship: Ship {
-                hot: 126_000_000,
-                cold: 26_000_000,
-            },
-            max_num_out: 10,
-            max_used: 98,
-        },
+        // AvailabileShips {
+        //     ship: Ship {
+        //         hot: 126_000_000,
+        //         cold: 26_000_000,
+        //     },
+        //     max_num_out: 10,
+        //     max_used: 98,
+        // },
     ];
 
     let rollers_out = RollersUsed::new();
@@ -54,18 +54,22 @@ fn main() {
         Quality::MaxOut,
     ])
     .unwrap();
-    let arena = Bump::new();
     let num_gigabytes = 16;
-    arena.set_allocation_limit(Some(num_gigabytes * 1024 * 1024 * 1024));
-    let plan = get_best_roll_plan(&available_rollers, state, start_state, &priorities, &arena);
+    let num_bytes = Some(num_gigabytes * 1024 * 1024 * 1024);
+    let (chart, qualities) = get_best_roll_chart(
+        &available_rollers,
+        state,
+        start_state,
+        &priorities,
+        num_bytes,
+    );
     println!(
         "{}% {} {}",
-        plan.qualities.roll_out_probability * 100.,
-        plan.qualities.average_num_passes,
-        plan.qualities.max_num_out
+        qualities.roll_out_probability * 100.,
+        qualities.average_num_passes,
+        qualities.max_num_out
     );
 
     let mut file = File::create("plan.txt").unwrap();
-    file.write_all(generate_flowchart(&plan).as_bytes())
-        .unwrap();
+    file.write_all(chart.to_text_chart().as_bytes()).unwrap();
 }

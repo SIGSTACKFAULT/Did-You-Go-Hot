@@ -1,154 +1,13 @@
-use std::collections::HashMap;
-
 use crate::{
-    chart_gen::{ChartGen, ConnectionPass, DecisionPath, DescisionBranches, Destination, NodeData},
-    hole_info::Mass,
-    roll_calc::{RollDecision, RollPlan, RollStep},
+    chart_gen::{
+        ConnectionPass, Destination, NodeConnectionData, NodeData, PassDecision, RollingChart,
+    },
+    roll_calc::RollPlan,
 };
-
-pub fn generate_flowchart(plan: &RollPlan) -> String {
-    let mut chart = ChartGen::new();
-
-    let id = plan as *const RollPlan as usize;
-    chart.add_node(id, plan_to_data(plan));
-
-    let mut memoize = HashMap::new();
-    generate_flowchart_rec(&mut chart, plan, true, &mut memoize);
-
-    chart.to_text_chart()
-}
-
-#[derive(Debug, Clone)]
-enum Connection {
-    Decision,
-    OnlyOption((HashMap<ConnectionPass, u32>, Destination)),
-    DirectToClosed,
-}
-
-fn generate_flowchart_rec(
-    chart: &mut ChartGen,
-    plan: &RollPlan,
-    force_links: bool,
-    memoize: &mut HashMap<usize, Connection>,
-) -> Connection {
-    let current_id = plan_id(plan);
-
-    if let Some(cached) = memoize.get(&current_id) {
-        return cached.clone();
-    }
-
-    let RollPlan {
-        decision:
-            RollDecision {
-                crit: crit_o,
-                shrink: shrink_o,
-                full: full_o,
-                ..
-            },
-        ..
-    } = plan;
-    let mut options = vec![];
-    if let Some(crit) = crit_o {
-        options.push((DecisionPath::Crit, crit));
-    }
-    if let Some(shrink) = shrink_o {
-        options.push((DecisionPath::Shrink, shrink));
-    }
-    if let Some(full) = full_o {
-        options.push((DecisionPath::Full, full));
-    }
-
-    if plan.decision.can_close {
-        if options.len() == 0 {
-            return Connection::DirectToClosed;
-        } else {
-            chart.add_edge(
-                current_id,
-                Destination::Closed,
-                None,
-                DescisionBranches::Split(vec![DecisionPath::Closed]),
-            );
-        }
-    }
-
-    let mut edges = vec![];
-    let no_decision = options.len() == 1 && !force_links && !plan.decision.can_close;
-    for (paths, next_step) in options {
-        let (mut down_chain, final_id) =
-            match generate_flowchart_rec(chart, &next_step.next_plan, false, memoize) {
-                Connection::OnlyOption(chain) => chain,
-                Connection::Decision => {
-                    add_node(chart, &next_step.next_plan);
-                    (
-                        HashMap::new(),
-                        Destination::Node(plan_id(&next_step.next_plan)),
-                    )
-                }
-                Connection::DirectToClosed => (HashMap::new(), Destination::Closed),
-            };
-        add_to_chain(&mut down_chain, &next_step);
-        if no_decision {
-            memoize.insert(current_id, Connection::OnlyOption((down_chain, final_id)));
-            return memoize.get(&current_id).unwrap().clone();
-        }
-        edges.push((final_id, Some(down_chain), paths));
-    }
-
-    let mut combined_edges = vec![];
-    for (dest, edge, paths) in edges {
-        let mut found = false;
-        for (edest, eedge, epaths) in combined_edges.iter_mut() {
-            if edest == &dest && eedge == &edge {
-                match epaths {
-                    DescisionBranches::Split(v) => v.push(paths),
-                    DescisionBranches::All => unreachable!(),
-                }
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            combined_edges.push((dest, edge, DescisionBranches::Split(vec![paths])));
-        }
-    }
-
-    if combined_edges.len() == 1 {
-        combined_edges[0].2 = DescisionBranches::All
-    }
-
-    for (final_id, chain, paths) in combined_edges {
-        chart.add_edge(current_id, final_id, chain, paths);
-    }
-
-    memoize.insert(current_id, Connection::Decision);
-    Connection::Decision
-}
-
-fn add_to_chain(chain: &mut HashMap<ConnectionPass, u32>, step: &RollStep) {
-    let key = ConnectionPass {
-        ship: step.ship,
-        state: step.ship_state,
-        direction: step.direction,
-    };
-    if let Some(option) = chain.get_mut(&key) {
-        *option += 1;
-    } else {
-        chain.insert(key, 1);
-    }
-}
-
-const MASS_DIVISOR: Mass = 1000000;
 
 fn plan_to_data(plan: &RollPlan) -> NodeData {
     NodeData {
         rollout_probability: plan.qualities.roll_out_probability,
-        extra_info: format!(
-            "mass: {}-{}\nmax: {}-{}",
-            plan.mass_range.least / MASS_DIVISOR,
-            plan.mass_range.most / MASS_DIVISOR,
-            plan.max_mass_range.least / MASS_DIVISOR,
-            plan.max_mass_range.most / MASS_DIVISOR
-        ),
     }
 }
 
@@ -156,7 +15,45 @@ fn plan_id(plan: &RollPlan) -> usize {
     plan as *const RollPlan as usize
 }
 
-fn add_node(chart: &mut ChartGen, next: &RollPlan) {
-    let next_id = plan_id(next);
-    chart.add_node(next_id, plan_to_data(&next));
+pub fn generate_roll_chart(plan: &RollPlan) -> RollingChart {
+    let from_id = plan_id(plan);
+    let mut chart = RollingChart::new(from_id, plan_to_data(plan));
+
+    generate_roll_chart_rec(plan, &mut chart, from_id);
+
+    chart.compress();
+    chart
+}
+
+pub fn generate_roll_chart_rec(plan: &RollPlan, chart: &mut RollingChart, from_id: usize) {
+    if plan.decision.can_close {
+        chart
+            .add_edge(from_id, Destination::Closed, PassDecision::Closed)
+            .unwrap();
+    }
+    for (step, decision) in [
+        (plan.decision.crit, PassDecision::Crit),
+        (plan.decision.shrink, PassDecision::Shrink),
+        (plan.decision.full, PassDecision::Full),
+    ] {
+        if let Some(step) = step {
+            let next_id = plan_id(step.next_plan);
+            chart.add_node(next_id, plan_to_data(step.next_plan));
+            chart
+                .add_edge(
+                    from_id,
+                    Destination::Node(NodeConnectionData {
+                        to: next_id,
+                        pass: ConnectionPass {
+                            ship: step.ship,
+                            state: step.ship_state,
+                            direction: step.direction,
+                        },
+                    }),
+                    decision,
+                )
+                .unwrap();
+            generate_roll_chart_rec(step.next_plan, chart, next_id);
+        }
+    }
 }
