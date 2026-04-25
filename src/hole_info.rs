@@ -89,7 +89,3 @@ pub const HOLES_INFO: [HoleInfo; 8] = [
 pub const fn kg(kg: Mass) -> Mass {
     kg
 }
-
-pub const fn kgr(kg: MassRange) -> MassRange {
-    kg
-}

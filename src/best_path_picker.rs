@@ -153,19 +153,19 @@ impl<'a, 'b> PathPicker<'a, 'b> {
         let mut splits = SmallVec::new();
 
         // push starting best combo
-        possible_combos.push(array::from_fn(|j| self.best_paths[j].get(0).cloned()));
+        possible_combos.push(array::from_fn(|j| self.best_paths[j].first().cloned()));
 
         let mut highest_so_far = [0; 3];
         for i in 0..=highest_significant_max_out_floor {
             let mut found_split = false;
-            for j in 0..3 {
-                if let Some(next_possible_step) = self.best_paths[j].get(highest_so_far[j] + 1) {
-                    if next_possible_step.next_plan.qualities.max_num_out <= i {
-                        highest_so_far[j] += 1;
-                        if !found_split {
-                            splits.push(i as usize);
-                            found_split = true;
-                        }
+            for (j, highest_so_far) in highest_so_far.iter_mut().enumerate() {
+                if let Some(next_possible_step) = self.best_paths[j].get(*highest_so_far + 1)
+                    && next_possible_step.next_plan.qualities.max_num_out <= i
+                {
+                    *highest_so_far += 1;
+                    if !found_split {
+                        splits.push(i as usize);
+                        found_split = true;
                     }
                 }
             }
@@ -194,7 +194,7 @@ fn cmp<'a>(
     path_i: usize,
     have_full_info: bool,
 ) -> Comparison<'a> {
-    if priorities.len() == 0 {
+    if priorities.is_empty() {
         return Comparison::Equal;
     }
 
@@ -301,7 +301,7 @@ fn cmp_theoretical(
     path_i: usize,
     have_full_info: bool,
 ) -> ComparisonTheoretical {
-    if priorities.len() == 0 {
+    if priorities.is_empty() {
         return ComparisonTheoretical::Equal;
     }
 

@@ -1,8 +1,6 @@
 use std::{
-    array,
-    f64::EPSILON,
-    hint,
-    simd::{Simd, f32x4, f64x4, num::SimdFloat},
+    array, hint,
+    simd::{f64x4, num::SimdFloat},
 };
 
 use bumpalo::Bump;
@@ -129,17 +127,12 @@ pub enum ShipState {
     Cold,
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Default)]
 pub enum HoleState {
+    #[default]
     Full,
     Shrink,
     Crit,
-}
-
-impl Default for HoleState {
-    fn default() -> Self {
-        Self::Full
-    }
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -185,7 +178,7 @@ pub fn get_best_roll_chart(
         max_single_jump_mass,
     };
 
-    let plan = RollPlan::clone(&get_best_roll_plan_rec(
+    let plan = RollPlan::clone(get_best_roll_plan_rec(
         available_rollers,
         state,
         priorities,
@@ -244,9 +237,9 @@ fn get_best_roll_plan_rec<'a>(
             HoleState::Shrink => 1,
             HoleState::Full => 2,
         };
-        for i in 0..3 {
+        for (i, should_ignore) in should_ignore_state.iter_mut().enumerate().take(3) {
             if i != stay_full {
-                should_ignore_state[i] = true;
+                *should_ignore = true;
             }
         }
     }
@@ -321,7 +314,7 @@ fn get_best_roll_plan_rec<'a>(
             available_rollers,
             mass_ranges[*i],
             new_max_ranges[*i],
-            &priorities,
+            priorities,
             memoization,
             arena,
             static_data,
@@ -338,7 +331,7 @@ fn get_best_roll_plan_rec<'a>(
                 available_rollers,
                 mass_ranges[*i],
                 new_max_ranges[*i],
-                &priorities,
+                priorities,
                 memoization,
                 arena,
                 static_data,
@@ -388,7 +381,7 @@ fn get_best_from_memoization<'a>(
     min_max_num_out: u16,
     memoization: &Memoizer<'a>,
 ) -> Option<&'a RollPlan<'a>> {
-    if let Some(cached_plans) = memoization.get(&state) {
+    if let Some(cached_plans) = memoization.get(state) {
         Some(get_best_plan_from_cached(min_max_num_out, cached_plans))
     } else {
         None
@@ -399,7 +392,7 @@ fn get_best_plan_from_cached<'a>(
     min_max_num_out: u16,
     cached_plans: &[&'a RollPlan<'a>],
 ) -> &'a RollPlan<'a> {
-    &cached_plans[(min_max_num_out as usize).min(cached_plans.len() - 1)]
+    cached_plans[(min_max_num_out as usize).min(cached_plans.len() - 1)]
 }
 
 fn create_roll_plan<'a>(
@@ -557,7 +550,7 @@ fn minimum_possible_qualities(
         let num_rollout_masses = range_after_all_in.least.abs() + 1;
         let rollout_probability =
             num_rollout_masses as f64 / (range_after_all_in.most + num_rollout_masses) as f64;
-        rollout_probability.max(EPSILON)
+        rollout_probability.max(f64::EPSILON)
     } else {
         0.0
     };
@@ -606,16 +599,16 @@ fn get_steps(
     used_rollers: &RollersUsed,
 ) -> SmallVec<[PotentialPass; PREDICTED_NUM_POTENTIAL_PASSES]> {
     let mut potential_passes = SmallVec::new();
-    for i in 0..available_rollers.len() {
+    for (i, available_ship) in available_rollers.iter().enumerate() {
         if rollers_out.get(i) == 0 {
             continue;
         }
         let mut new_out_rollers = *rollers_out;
-        let in_ship = available_rollers[i].ship;
+        let in_ship = available_ship.ship;
         new_out_rollers.sub(i);
 
         potential_passes.push(PotentialPass {
-            new_out_rollers: new_out_rollers,
+            new_out_rollers,
             mass: in_ship.cold,
             direction: Direction::In,
             ship_state: ShipState::Cold,
@@ -623,7 +616,7 @@ fn get_steps(
             new_used_ships: *used_rollers,
         });
         potential_passes.push(PotentialPass {
-            new_out_rollers: new_out_rollers,
+            new_out_rollers,
             mass: in_ship.hot,
             direction: Direction::In,
             ship_state: ShipState::Hot,
@@ -642,7 +635,7 @@ fn get_steps(
             continue;
         }
         potential_passes.push(PotentialPass {
-            new_out_rollers: new_out_rollers,
+            new_out_rollers,
             mass: out_ship.cold,
             direction: Direction::Out,
             ship_state: ShipState::Cold,
@@ -650,7 +643,7 @@ fn get_steps(
             new_used_ships: new_used_rollers,
         });
         potential_passes.push(PotentialPass {
-            new_out_rollers: new_out_rollers,
+            new_out_rollers,
             mass: out_ship.hot,
             direction: Direction::Out,
             ship_state: ShipState::Hot,

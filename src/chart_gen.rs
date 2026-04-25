@@ -78,7 +78,7 @@ impl RollingChart {
             head: head_idx,
             closed: closed_idx,
             ids: HashMap::from([(head, head_idx)]),
-            graph: graph,
+            graph,
         }
     }
 
@@ -413,7 +413,7 @@ impl RollingChart {
             };
 
             // Start formatting the edge text block
-            let _ = write!(chart, "n_{} -->|{}\n", from_idx.index(), decision_text);
+            let _ = writeln!(chart, "n_{} -->|{}", from_idx.index(), decision_text);
 
             // Add pass details
             for (pass, num) in &edge.weight().actions {
@@ -444,7 +444,7 @@ impl RollingChart {
         chart
     }
 
-    pub fn chart_walker(&self) -> ChartWalker {
+    pub fn chart_walker(&self) -> ChartWalker<'_> {
         ChartWalker {
             graph: &self.graph,
             current: self.head,

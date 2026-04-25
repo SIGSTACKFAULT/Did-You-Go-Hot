@@ -1,10 +1,10 @@
-use std::{cmp::Ordering, collections::HashMap};
+use std::cmp::Ordering;
 
 use rand::RngExt;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    best_path_picker::{Priorities, Qualities, Quality},
+    best_path_picker::{Priorities, Quality},
     chart_gen::{ConnectionPass, EdgeData, PassDecision, RollingChart},
     hole_info::{HoleInfo, Mass},
     roll_calc::{
@@ -30,13 +30,13 @@ enum SimHoleState {
     Full,
 }
 
-impl Into<PassDecision> for SimHoleState {
-    fn into(self) -> PassDecision {
-        match self {
-            Self::Closed => PassDecision::Closed,
-            Self::Crit => PassDecision::Crit,
-            Self::Shrink => PassDecision::Shrink,
-            Self::Full => PassDecision::Full,
+impl From<SimHoleState> for PassDecision {
+    fn from(val: SimHoleState) -> Self {
+        match val {
+            SimHoleState::Closed => PassDecision::Closed,
+            SimHoleState::Crit => PassDecision::Crit,
+            SimHoleState::Shrink => PassDecision::Shrink,
+            SimHoleState::Full => PassDecision::Full,
         }
     }
 }
@@ -45,7 +45,7 @@ pub fn test_calced_roll_plans() {
     let average_masses = [3_000_000_000, 2_000_000_000, 1_000_000_000];
     let starting_masses = [HoleState::Full, HoleState::Shrink, HoleState::Crit];
 
-    const normal_rollers: &[AvailabileShips] = &[
+    const NORMAL_ROLLERS: &[AvailabileShips] = &[
         AvailabileShips {
             ship: Ship {
                 hot: 301_200_000,
@@ -63,7 +63,7 @@ pub fn test_calced_roll_plans() {
             max_used: 98,
         },
     ];
-    const only_bs: &[AvailabileShips] = &[AvailabileShips {
+    const ONLY_BS: &[AvailabileShips] = &[AvailabileShips {
         ship: Ship {
             hot: 301_200_000,
             cold: 201_200_000,
@@ -81,7 +81,7 @@ pub fn test_calced_roll_plans() {
     let mut tests = vec![];
     for mass in average_masses {
         for state in starting_masses {
-            for rollers in &[normal_rollers, only_bs] {
+            for rollers in &[NORMAL_ROLLERS, ONLY_BS] {
                 tests.push((mass, state, rollers));
             }
         }

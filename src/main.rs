@@ -1,17 +1,15 @@
 #![feature(portable_simd)]
 #![feature(int_roundings)]
 
-use std::{collections::HashMap, fs::File, io::Write};
+use std::{fs::File, io::Write};
 
-use bumpalo::Bump;
 
 use crate::{
     best_path_picker::{Priorities, Quality},
-    chart_gen::{ConnectionPass, Destination, NodeData},
-    hole_info::{HoleInfo, Mass},
+    hole_info::HoleInfo,
     hole_plan_tester::test_calced_roll_plans,
     roll_calc::{
-        AvailabileShips, HoleState, RollDecision, RollPlan, RollState, RollStep, RollersUsed, Ship,
+        AvailabileShips, HoleState, RollState, RollersUsed, Ship,
         get_best_roll_chart,
     },
 };
