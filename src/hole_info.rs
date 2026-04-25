@@ -1,8 +1,10 @@
 use std::ops::Sub;
 
+use crate::roll_calc::HoleState;
+
 pub type Mass = i64;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, PartialOrd, Ord)]
 pub struct MassRange {
     pub least: Mass,
     pub most: Mass,
@@ -11,7 +13,7 @@ pub struct MassRange {
 impl MassRange {
     pub fn size(&self) -> Mass {
         // +1 because inclusive
-        (self.most - self.least + 1).max(0) 
+        (self.most - self.least + 1).max(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -23,7 +25,10 @@ impl Sub<Mass> for MassRange {
     type Output = Self;
 
     fn sub(self, rhs: Mass) -> Self::Output {
-        Self {least: self.least - rhs, most: self.most - rhs}
+        Self {
+            least: self.least - rhs,
+            most: self.most - rhs,
+        }
     }
 }
 
@@ -40,6 +45,14 @@ impl HoleInfo {
         Self {
             average_max_size: avg,
             max_range: mr(down, up),
+        }
+    }
+
+    pub fn mass_range(&self, state: HoleState) -> MassRange {
+        match state {
+            HoleState::Full => self.full_mass_range(),
+            HoleState::Shrink => self.shrink_mass_range(),
+            HoleState::Crit => self.crit_mass_range(),
         }
     }
 

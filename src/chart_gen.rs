@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use crate::{
     hole_info::Mass,
-    roll_calc::{Direction, HoleState, Ship, ShipState},
+    roll_calc::{Direction, Ship, ShipState},
 };
 use petgraph::algo::toposort;
 use petgraph::visit::EdgeRef;
@@ -26,6 +26,15 @@ pub struct ConnectionPass {
     pub direction: Direction,
 }
 
+impl ConnectionPass {
+    pub fn mass(&self) -> Mass {
+        match self.state {
+            ShipState::Cold => self.ship.cold,
+            ShipState::Hot => self.ship.hot,
+        }
+    }
+}
+
 pub struct NodeConnectionData {
     pub to: usize,
     pub pass: ConnectionPass,
@@ -37,9 +46,9 @@ pub enum Destination {
 }
 
 #[derive(Debug, Clone)]
-struct EdgeData {
-    decision: PassDecision,
-    actions: HashMap<ConnectionPass, u32>,
+pub struct EdgeData {
+    pub decision: PassDecision,
+    pub actions: HashMap<ConnectionPass, u16>,
 }
 
 pub struct RollingChart {
@@ -320,7 +329,7 @@ impl RollingChart {
         &self,
         node: NodeIndex<u32>,
         depth: usize,
-        depth_decisions: &mut Vec<HashMap<PassDecision, HashMap<ConnectionPass, u32>>>,
+        depth_decisions: &mut Vec<HashMap<PassDecision, HashMap<ConnectionPass, u16>>>,
     ) -> bool {
         let Some(Node::Node(_)) = self.graph.node_weight(node) else {
             // No decisions at closed node or doesn't exist
@@ -362,15 +371,15 @@ impl RollingChart {
     }
 
     pub fn compress(&mut self) {
-        self.compress_direct_to_closed();
-        self.compress_no_decision_chains();
-        self.combine_identical_decision_paths();
-        // Rerun compress_no_decision_chains to clean up any new chains created by combine_identical_decision_paths
-        self.compress_no_decision_chains();
+        // self.compress_direct_to_closed();
+        // self.compress_no_decision_chains();
+        // self.combine_identical_decision_paths();
+        // // Rerun compress_no_decision_chains to clean up any new chains created by combine_identical_decision_paths
+        // self.compress_no_decision_chains();
 
-        // Clean up the index map to discard no longer necessary, dropped nodes.
-        self.ids
-            .retain(|_, &mut idx| self.graph.node_weight(idx).is_some());
+        // // Clean up the index map to discard no longer necessary, dropped nodes.
+        // self.ids
+        //     .retain(|_, &mut idx| self.graph.node_weight(idx).is_some());
     }
 
     pub fn to_text_chart(&self) -> String {
@@ -408,10 +417,7 @@ impl RollingChart {
 
             // Add pass details
             for (pass, num) in &edge.weight().actions {
-                let mass = match pass.state {
-                    ShipState::Cold => pass.ship.cold,
-                    ShipState::Hot => pass.ship.hot,
-                } / MASS_DIVISOR;
+                let mass = pass.mass() / MASS_DIVISOR;
 
                 let dir = match pass.direction {
                     Direction::In => "IN",
@@ -436,5 +442,48 @@ impl RollingChart {
         }
 
         chart
+    }
+
+    pub fn chart_walker(&self) -> ChartWalker {
+        ChartWalker {
+            graph: &self.graph,
+            current: self.head,
+            closed: self.closed,
+        }
+    }
+}
+
+pub struct ChartWalker<'a> {
+    graph: &'a StableDiGraph<Node, EdgeData>,
+    current: NodeIndex<u32>,
+    closed: NodeIndex<u32>,
+}
+
+impl<'a> ChartWalker<'a> {
+    pub fn peak_options(&self) -> impl Iterator<Item = &EdgeData> {
+        self.graph
+            .edges_directed(self.current, petgraph::Direction::Outgoing)
+            .map(|e| e.weight())
+    }
+
+    pub fn take_option(&mut self, decision: PassDecision) -> Result<&EdgeData, ()> {
+        for edge in self
+            .graph
+            .edges_directed(self.current, petgraph::Direction::Outgoing)
+        {
+            let edge_decision = edge.weight().decision;
+            let found = match edge_decision {
+                PassDecision::NotClosed => matches!(
+                    decision,
+                    PassDecision::Crit | PassDecision::Shrink | PassDecision::Full
+                ),
+                _ => edge_decision == decision,
+            };
+            if found {
+                self.current = edge.target();
+                return Ok(edge.weight());
+            }
+        }
+        Err(())
     }
 }

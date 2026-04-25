@@ -25,3 +25,5 @@ flamegraph.svg
 plan.txt
 perf.data
 perf.data.old
+.zed/debug.json
+flamegraph_before_avoiding_heap.svg

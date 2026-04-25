@@ -1,3 +1,6 @@
+#![feature(portable_simd)]
+#![feature(int_roundings)]
+
 use std::{collections::HashMap, fs::File, io::Write};
 
 use bumpalo::Bump;
@@ -6,6 +9,7 @@ use crate::{
     best_path_picker::{Priorities, Quality},
     chart_gen::{ConnectionPass, Destination, NodeData},
     hole_info::{HoleInfo, Mass},
+    hole_plan_tester::test_calced_roll_plans,
     roll_calc::{
         AvailabileShips, HoleState, RollDecision, RollPlan, RollState, RollStep, RollersUsed, Ship,
         get_best_roll_chart,
@@ -19,6 +23,9 @@ mod hole_plan_tester;
 mod roll_calc;
 
 fn main() {
+    test_calced_roll_plans();
+    return;
+
     let available_rollers = [
         AvailabileShips {
             ship: Ship {
@@ -28,14 +35,14 @@ fn main() {
             max_num_out: 1,
             max_used: 99,
         },
-        // AvailabileShips {
-        //     ship: Ship {
-        //         hot: 126_000_000,
-        //         cold: 26_000_000,
-        //     },
-        //     max_num_out: 10,
-        //     max_used: 98,
-        // },
+        AvailabileShips {
+            ship: Ship {
+                hot: 126_000_000,
+                cold: 26_000_000,
+            },
+            max_num_out: 10,
+            max_used: 98,
+        },
     ];
 
     let rollers_out = RollersUsed::new();

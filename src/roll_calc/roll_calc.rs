@@ -1,4 +1,9 @@
-use std::{array, f64::EPSILON, hint};
+use std::{
+    array,
+    f64::EPSILON,
+    hint,
+    simd::{Simd, f32x4, f64x4, num::SimdFloat},
+};
 
 use bumpalo::Bump;
 use rustc_hash::FxHashMap;
@@ -215,12 +220,12 @@ fn get_best_roll_plan_rec<'a>(
         crit_range(&state.max_size_range),
         shrink_range(&state.max_size_range),
         full_range(&state.max_size_range),
+        closed_range(),
     ];
-    let mut mass_ranges: [MassRange; 3] =
+    let mut mass_ranges: [MassRange; 4] =
         array::from_fn(|i| overlap(&max_mass_ranges[i], &state.remaining_mass));
-    let mass_range_for_closed = overlap(&closed_range(), &state.remaining_mass);
 
-    let mut should_ignore_state = [false; 3];
+    let mut should_ignore_state = [false; 4];
     match state.highest_hole_state {
         HoleState::Crit => {
             should_ignore_state[1] = true;
@@ -252,40 +257,35 @@ fn get_best_roll_plan_rec<'a>(
         }
     }
 
-    let possible_closed_states = calc_possible_states(mass_range_for_closed, state.max_size_range);
-
     // Assuming it became that state, calculate the new max mass ranges for each hole based on the possible mass range.
-    const MAX_RANGE_UPDATERS: [fn(&MassRange, &MassRange) -> MassRange; 3] = [
+    const MAX_RANGE_UPDATERS: [fn(&MassRange, &MassRange) -> MassRange; 4] = [
         update_max_range_from_crit,
         update_max_range_from_shrink,
         update_max_range_from_full,
+        update_max_range_from_closed,
     ];
-    let new_max_ranges: [MassRange; 3] =
+    let new_max_ranges: [MassRange; 4] =
         array::from_fn(|i| MAX_RANGE_UPDATERS[i](&mass_ranges[i], &state.max_size_range));
 
     // Get the possible number of states that could result in each hole state.
-    let possible_states: [u128; 3] = array::from_fn(|i| {
-        if !mass_ranges[i].is_empty() {
-            calc_possible_states(mass_ranges[i], new_max_ranges[i])
-        } else {
-            0
-        }
-    });
+    let possible_states: [u128; 4] =
+        array::from_fn(|i| calc_possible_states(mass_ranges[i], new_max_ranges[i]));
 
-    let all_possible_states = possible_closed_states + possible_states.iter().sum::<u128>();
+    let all_possible_states = possible_states.iter().sum::<u128>();
 
     // If the hole is closed, the rollout probability is 0 if all rollers are in. Otherwise, it's 1.
-    let closed_roll_out_probability_raw = if !state.rollers_out.any_out() {
+    let closed_roll_out_probability = if !state.rollers_out.any_out() {
         0.0
     } else {
         1.0
     };
 
-    if all_possible_states == possible_closed_states {
+    // If the hole is closed, the rollout probability is 0 if all rollers are in. Otherwise, it's 1.
+    if all_possible_states == possible_states[3] {
         return arena.alloc(RollPlan {
             qualities: Qualities {
                 max_num_out: base_max_num_out,
-                roll_out_probability: closed_roll_out_probability_raw,
+                roll_out_probability: closed_roll_out_probability,
                 average_num_passes: 0.0,
             },
             decision: RollDecision {
@@ -348,9 +348,9 @@ fn get_best_roll_plan_rec<'a>(
 
     let BestOptions { best_paths, splits } = best_paths.best();
 
-    let closed_probability = geometric_probability(possible_closed_states, all_possible_states);
-    let probabilities: [f64; 3] =
-        array::from_fn(|i| geometric_probability(possible_states[i], all_possible_states));
+    let probabilities = f64x4::from_array(array::from_fn(|i| {
+        geometric_probability(possible_states[i], all_possible_states)
+    }));
 
     let mut splits = splits.into_iter();
     let paths = best_paths.into_iter();
@@ -366,9 +366,9 @@ fn get_best_roll_plan_rec<'a>(
             steps,
             &state,
             base_max_num_out,
-            closed_probability * closed_roll_out_probability_raw,
             probabilities,
-            possible_closed_states != 0,
+            closed_roll_out_probability,
+            probabilities[3] != 0.0,
             arena,
         );
         // When end is None the last one just has to be the worst case.
@@ -406,8 +406,8 @@ fn create_roll_plan<'a>(
     steps: [Option<RollStep<'a>>; 3],
     state: &RollState,
     mut min_max_num_out: u16,
+    probabilities: f64x4,
     closed_roll_out_probability: f64,
-    probabilities: [f64; 3],
     can_close: bool,
     arena: &'a Bump,
 ) -> &'a mut RollPlan<'a> {
@@ -420,31 +420,31 @@ fn create_roll_plan<'a>(
             .map(|best_next| &*arena.alloc(best_next))
     });
 
-    let rollout_probabilities: [f64; 3] = array::from_fn(|i| {
+    let rollout_probabilities = f64x4::from_array(array::from_fn(|i| {
+        if i == 3 {
+            return closed_roll_out_probability;
+        }
         if let Some(plan) = &plans[i] {
             plan.next_plan.qualities.roll_out_probability
         } else {
             0.0
         }
-    });
+    }));
 
-    let average_passes: [f64; 3] = array::from_fn(|i| {
+    let average_passes = f64x4::from_array(array::from_fn(|i| {
+        if i == 3 {
+            return 0.0;
+        }
         if let Some(plan) = &plans[i] {
             plan.next_plan.qualities.average_num_passes
         } else {
             0.0
         }
-    });
+    }));
 
-    let roll_out_probability = closed_roll_out_probability
-        + probabilities[0] * rollout_probabilities[0]
-        + probabilities[1] * rollout_probabilities[1]
-        + probabilities[2] * rollout_probabilities[2];
+    let roll_out_probability = (probabilities * rollout_probabilities).reduce_sum();
 
-    let average_num_passes = 1.0
-        + probabilities[0] * average_passes[0]
-        + probabilities[1] * average_passes[1]
-        + probabilities[2] * average_passes[2];
+    let average_num_passes = 1.0 + (probabilities * average_passes).reduce_sum();
 
     for plan in &plans {
         min_max_num_out = min_max_num_out.max(
@@ -706,6 +706,13 @@ fn update_max_range_from_full(possible_mass: &MassRange, max_mass_range: &MassRa
         max_mass_range.least,
         largest_possible_hole.min(max_mass_range.most),
     )
+}
+
+fn update_max_range_from_closed(
+    _possible_mass: &MassRange,
+    max_mass_range: &MassRange,
+) -> MassRange {
+    *max_mass_range
 }
 
 fn full_range(max_size_range: &MassRange) -> MassRange {
