@@ -6,6 +6,7 @@ use eframe::egui::{
 };
 use flate2::{Compression, write::ZlibEncoder};
 use serde::Serialize;
+use sysinfo::System; // Added sysinfo import
 
 use crate::{
     best_path_picker::{Priorities, Qualities, Quality},
@@ -16,6 +17,8 @@ use crate::{
         get_best_roll_chart,
     },
 };
+
+const GB: f64 = 1_073_741_824.0;
 
 pub fn run_app() {
     eframe::run_native(
@@ -129,6 +132,8 @@ struct RollApp {
     advanced_min_mass: String,
     #[serde(skip)]
     advanced_max_mass: String,
+    #[serde(skip)]
+    advanced_max_memory_gb: String, // Added memory string state
 
     #[serde(skip)]
     adding_hot: String,
@@ -147,7 +152,22 @@ struct RollApp {
 
 impl Default for RollApp {
     fn default() -> Self {
-        let out = Self {
+        // Query system memory using sysinfo
+        let mut sys = System::new();
+        sys.refresh_memory();
+
+        // Calculate 1/4 of total memory and format it to GB
+        let quarter_mem_bytes = sys.total_memory() / 4;
+        let quarter_mem_gb = (quarter_mem_bytes as f64 / GB).round();
+
+        // Ensure a valid fallback if memory fetching fails or is 0
+        let advanced_max_memory_gb = if quarter_mem_gb > 0.0 {
+            quarter_mem_gb.to_string()
+        } else {
+            "4".to_string() // Fallback to 4GB
+        };
+
+        Self {
             guide: None,
             calculated_plans: None,
             selected_hole: None,
@@ -161,14 +181,13 @@ impl Default for RollApp {
             ships: Vec::new(),
             advanced_min_mass: String::new(),
             advanced_max_mass: String::new(),
+            advanced_max_memory_gb, // Initialize with dynamically calculated memory
             adding_hot: String::new(),
             adding_cold: String::new(),
             adding_name: String::new(),
             error: String::new(),
             calculation_handle: None,
-        };
-
-        out
+        }
     }
 }
 
@@ -209,6 +228,22 @@ impl RollApp {
         let Some(hole_size) = self.selected_hole else {
             self.error = "Hole size must be selected".to_string();
             return;
+        };
+
+        // Parse memory
+        let max_memory = if self.advanced_max_memory_gb.trim().is_empty() {
+            None
+        } else {
+            match self.advanced_max_memory_gb.trim().parse::<f64>() {
+                Ok(gb) => {
+                    let bytes = (gb * GB) as usize;
+                    Some(bytes)
+                }
+                Err(_) => {
+                    self.error = "Max Memory limit must be a valid number.".to_string();
+                    return;
+                }
+            }
         };
 
         // Parse advanced mass limitations
@@ -274,11 +309,13 @@ impl RollApp {
         }
 
         let mut rollers_out = RollersUsed::new();
+        let mut used_ships = RollersUsed::new();
         let mut available_rollers = vec![];
         for ship in &self.ships {
             if ship.enabled {
                 for _ in 0..ship.already_outside {
                     rollers_out.add(available_rollers.len());
+                    used_ships.add(available_rollers.len());
                 }
                 available_rollers.push(AvailabileShips {
                     ship: ship.ship,
@@ -292,12 +329,11 @@ impl RollApp {
             rollers_out,
             max_size_range: hole.max_range,
             highest_hole_state: self.selected_state,
-            used_ships: RollersUsed::new(),
+            used_ships,
         };
         let starting_state = self.selected_state;
         let priorities = Priorities::new(self.quality_priority.to_vec()).unwrap();
         let polo_guide = self.polarization_guide;
-        let max_memory = None;
         let start_polo_num = 0;
 
         self.calculation_handle = Some(std::thread::spawn(move || {
@@ -651,6 +687,13 @@ impl RollApp {
                                     ui.add(
                                         TextEdit::singleline(&mut self.advanced_max_mass)
                                             .hint_text("Unknown"),
+                                    );
+                                    ui.end_row();
+
+                                    ui.label("Max Memory Limit (GB):");
+                                    ui.add(
+                                        TextEdit::singleline(&mut self.advanced_max_memory_gb)
+                                            .hint_text("e.g. 4"),
                                     );
                                     ui.end_row();
                                 });
