@@ -1,8 +1,12 @@
-use std::{array, fmt::Display, mem};
+use core::slice;
+use std::{array, fmt::Display, io::Write, mem};
 
+use base64::engine::general_purpose::URL_SAFE;
 use eframe::egui::{
     CentralPanel, Color32, ComboBox, DragValue, Grid, Layout, Panel, ScrollArea, Spinner, TextEdit,
 };
+use flate2::{Compression, write::ZlibEncoder};
+use serde::Serialize;
 
 use crate::{
     best_path_picker::{Priorities, Qualities, Quality},
@@ -16,7 +20,7 @@ use crate::{
 
 pub fn run_app() {
     eframe::run_native(
-        "Roll App",
+        "Did You Go Hot?",
         Default::default(),
         Box::new(|cc| Ok(Box::new(RollApp::new(cc)))),
     )
@@ -137,7 +141,7 @@ struct RollApp {
 
 impl Default for RollApp {
     fn default() -> Self {
-        let mut out = Self {
+        let out = Self {
             guide: None,
             calculated_plans: None,
             selected_hole: None,
@@ -251,22 +255,22 @@ impl RollApp {
     }
 
     fn add_chart_guide(&mut self, chart: RollingChart) {
-        let first_move = match chart.chart_walker().peak_options() {
+        let (first_move_decision, first_actions) = match chart.chart_walker().peak_options() {
             PeakedOptions::Closed => unreachable!(),
             PeakedOptions::Options(options) => {
                 assert!(options.len() == 1);
-                options[0].decision
+                (options[0].decision, actions_to_text(&options[0].actions))
             }
         };
 
         self.guide = Some(ChartGuide {
             chart,
             next_options: CachedNextOptions::Closed, // Temporary next_options which will be overwritten before being shown
-            previous_options: vec![],
+            previous_options: vec![first_actions],
             path: vec![],
         });
 
-        self.take_decision(first_move);
+        self.take_decision(first_move_decision);
     }
 
     fn take_decision(&mut self, decision: PassDecision) {
@@ -299,18 +303,9 @@ impl RollApp {
             // Fill the rest of the vertical space from the top down
             ui.with_layout(Layout::top_down(eframe::egui::Align::LEFT), |ui| {
                 // Top Action Buttons
-                ui.horizontal(|ui| {
-                    if ui.button("Calculate").clicked() {
-                        self.calculate(ui.ctx().clone());
-                    }
-                    if ui.button("Reset").clicked() {
-                        self.error.clear();
-                        self.calculated_plans = None;
-                        if let Some(old_guide) = self.guide.take() {
-                            self.add_chart_guide(old_guide.chart);
-                        }
-                    }
-                });
+                if ui.button("Calculate").clicked() {
+                    self.calculate(ui.ctx().clone());
+                }
 
                 ui.separator();
 
@@ -630,6 +625,20 @@ impl RollApp {
             return;
         }
 
+        if self.guide.is_some() {
+            ui.horizontal(|ui| {
+                if ui.button("Reset").clicked() {
+                    self.error.clear();
+                    self.calculated_plans = None;
+                    if let Some(old_guide) = self.guide.take() {
+                        self.add_chart_guide(old_guide.chart);
+                    }
+                }
+                if ui.button("Open Flowchart").clicked() {
+                    self.open_flowchart();
+                }
+            });
+        }
         // 3. Existing standard logic
         let Some(guide) = &self.guide else {
             if self.calculated_plans.is_none() && self.calculation_handle.is_none() {
@@ -642,6 +651,7 @@ impl RollApp {
             }
             return;
         };
+
         for (i, previous_actions) in guide.previous_options.iter().enumerate() {
             ui.label(previous_actions);
             if i != guide.previous_options.len() - 1 {
@@ -682,6 +692,46 @@ impl RollApp {
         }
         if let Some(option) = to_take {
             self.take_decision(option);
+        }
+    }
+
+    fn open_flowchart(&mut self) {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct MermaidState {
+            code: String,
+            mermaid: MermaidConfig,
+            auto_sync: bool,
+            update_editor: bool,
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct MermaidConfig {
+            theme: String,
+        }
+
+        let code = self.guide.as_ref().unwrap().chart.to_text_chart();
+        let state = MermaidState {
+            code: code.to_string(),
+            mermaid: MermaidConfig {
+                theme: "default".to_string(),
+            },
+            auto_sync: true,
+            update_editor: true,
+        };
+
+        let json_str = serde_json::to_string(&state).unwrap();
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(json_str.as_bytes()).unwrap();
+        let compressed_bytes = encoder.finish().unwrap();
+
+        // 4. Encode to URL-safe Base64
+        let base64_str = base64::Engine::encode(&URL_SAFE, compressed_bytes);
+
+        let url = format!("https://mermaid.live/edit#pako:{}", base64_str);
+        if webbrowser::open(&url).is_err() {
+            self.error = format!("Failed to open browser with url");
         }
     }
 }

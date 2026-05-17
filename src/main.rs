@@ -21,6 +21,8 @@ mod roll_calc;
 mod ui;
 
 fn main() {
+    // test_calced_roll_plans();
+
     run_app();
 
 

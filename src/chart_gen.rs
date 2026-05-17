@@ -133,6 +133,8 @@ impl RollingChart {
             };
             if *existing.weight().actions.keys().next().unwrap() != pass {
                 return Err(());
+            } else {
+                return Ok(());
             }
         }
 
@@ -422,7 +424,7 @@ impl RollingChart {
             let _ = writeln!(chart, "n_{} -->|{}", from_idx.index(), decision_text);
 
             // Add pass details
-            write!(chart, "{}", actions_to_text(&edge.weight().actions));
+            write!(chart, "{}", actions_to_text(&edge.weight().actions)).unwrap();
 
             // Determine destination text.
             // For Closed, we generate a unique ID so lines do not converge.
