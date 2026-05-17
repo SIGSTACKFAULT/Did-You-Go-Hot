@@ -128,7 +128,9 @@ pub enum ShipState {
     Cold,
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Default)]
+#[derive(
+    serde::Deserialize, serde::Serialize, Debug, Clone, Copy, Hash, PartialEq, Eq, Default,
+)]
 pub enum HoleState {
     #[default]
     Full,
@@ -136,7 +138,7 @@ pub enum HoleState {
     Crit,
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Ship {
     pub hot: Mass,
     pub cold: Mass,
@@ -159,6 +161,7 @@ impl Ship {
     }
 }
 
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy)]
 pub enum PolorizationGuide {
     UpTo(u8),
     FirstPossiblePlusN(u8),

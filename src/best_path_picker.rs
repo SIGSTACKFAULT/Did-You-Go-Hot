@@ -412,7 +412,9 @@ fn step_mass(step: &RollStep) -> Mass {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    serde::Deserialize, serde::Serialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub enum Quality {
     MaxOut,
     ROProbability,

@@ -1,30 +1,39 @@
-use std::{array, fmt::Display, mem, ops::RangeInclusive};
+use std::{array, fmt::Display, mem};
 
-use eframe::{
-    egui::{CentralPanel, ComboBox, Grid, Panel, Slider, TextBuffer, Ui},
-    emath::Numeric,
+use eframe::egui::{
+    CentralPanel, Color32, ComboBox, DragValue, Grid, Layout, Panel, ScrollArea, Spinner, TextEdit,
 };
 
 use crate::{
+    best_path_picker::{Priorities, Qualities, Quality},
     chart_gen::{PassDecision, PeakedOptions, RollingChart, actions_to_text},
     hole_info::{HoleInfo, Mass},
-    roll_calc::Ship,
+    roll_calc::{
+        AvailabileShips, HoleState, PolorizationGuide, RollState, RollersUsed, Ship,
+        get_best_roll_chart,
+    },
 };
-
-const MAX_NUM_AVAILABLE: usize = 10;
-const MAX_MAX_USES: usize = 15;
-const DEFAULT_MASS_TEXT: &str = "Enter mass in tons";
-const DEFAULT_NAME_TEXT: &str = "Enter ship name";
 
 pub fn run_app() {
     eframe::run_native(
         "Roll App",
         Default::default(),
-        Box::new(|cc| Ok(Box::new(RollApp::new()))),
-    );
+        Box::new(|cc| Ok(Box::new(RollApp::new(cc)))),
+    )
+    .expect("Failed to run UI");
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+impl Display for HoleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HoleState::Full => write!(f, "Full"),
+            HoleState::Shrink => write!(f, "Shrink"),
+            HoleState::Crit => write!(f, "Crit"),
+        }
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone, PartialEq, Eq, Copy)]
 enum HollSizes {
     M100,
     M500,
@@ -66,12 +75,28 @@ impl HollSizes {
     }
 }
 
+impl Default for PolorizationGuide {
+    fn default() -> Self {
+        PolorizationGuide::FirstPossiblePlusN(1)
+    }
+}
+
+impl Display for Quality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Quality::MaxOut => write!(f, "Max Out"),
+            Quality::ROProbability => write!(f, "RO Probability"),
+            Quality::AvgNumPasses => write!(f, "Avg Num Passes"),
+        }
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
 struct ProvidedShip {
     ship: Ship,
     name: String,
     enabled: bool,
-    number_available: Option<usize>,
-    max_uses: Option<usize>,
+    number_available: u8,
 }
 
 struct ChartGuide {
@@ -81,21 +106,72 @@ struct ChartGuide {
     path: Vec<PassDecision>,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 struct RollApp {
+    #[serde(skip)]
     guide: Option<ChartGuide>,
+    #[serde(skip)]
+    calculated_plans: Option<Vec<(RollingChart, Qualities)>>,
 
     selected_hole: Option<HollSizes>,
+    selected_state: HoleState,
+    polarization_guide: PolorizationGuide,
+    quality_priority: [Quality; 3],
     ships: Vec<ProvidedShip>,
+
+    #[serde(skip)]
     adding_hot: String,
+    #[serde(skip)]
     adding_cold: String,
+    #[serde(skip)]
     adding_name: String,
+
+    #[serde(skip)]
+    error: String,
+
+    // Thread handle returning the calculation result.
+    #[serde(skip)]
+    calculation_handle: Option<std::thread::JoinHandle<Vec<Option<(RollingChart, Qualities)>>>>,
+}
+
+impl Default for RollApp {
+    fn default() -> Self {
+        let mut out = Self {
+            guide: None,
+            calculated_plans: None,
+            selected_hole: None,
+            selected_state: HoleState::default(),
+            polarization_guide: PolorizationGuide::default(),
+            quality_priority: [
+                Quality::ROProbability,
+                Quality::AvgNumPasses,
+                Quality::MaxOut,
+            ],
+            ships: Vec::new(),
+            adding_hot: String::new(),
+            adding_cold: String::new(),
+            adding_name: String::new(),
+            error: String::new(),
+            calculation_handle: None,
+        };
+
+        out
+    }
 }
 
 impl eframe::App for RollApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(eframe::APP_KEY, serde_json::to_string(self).unwrap());
+    }
+
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
-        Panel::left("Selection pannel").show_inside(ui, |ui| {
-            self.show_selection_panel(ui);
-        });
+        Panel::left("Selection_panel")
+            .resizable(true)
+            .min_size(250.0)
+            .show_inside(ui, |ui| {
+                self.show_selection_panel(ui);
+            });
         CentralPanel::default_margins().show_inside(ui, |ui| {
             self.walkthrough_roll(ui);
         });
@@ -103,16 +179,75 @@ impl eframe::App for RollApp {
 }
 
 impl RollApp {
-    pub fn new() -> Self {
-        let out = Self {
-            selected_hole: None,
-            ships: Vec::new(),
-            adding_hot: DEFAULT_MASS_TEXT.to_string(),
-            adding_cold: DEFAULT_MASS_TEXT.to_string(),
-            adding_name: DEFAULT_NAME_TEXT.to_string(),
-            guide: None,
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Load persistent state if available
+        if let Some(storage) = cc.storage {
+            if let Some(json) = storage.get_string(eframe::APP_KEY) {
+                return serde_json::from_str(&json).unwrap_or_default();
+            }
+        }
+        Default::default()
+    }
+
+    fn calculate(&mut self, ctx: eframe::egui::Context) {
+        self.error.clear();
+        self.calculated_plans = None;
+        self.guide = None;
+
+        let Some(hole_size) = self.selected_hole else {
+            self.error = "Hole size must be selected".to_string();
+            return;
         };
-        out
+        let hole = hole_size.hole_info();
+        let state = RollState {
+            remaining_mass: hole.mass_range(self.selected_state.clone()),
+            rollers_out: RollersUsed::new(),
+            max_size_range: hole.max_range,
+            highest_hole_state: self.selected_state.clone(),
+            used_ships: RollersUsed::new(),
+        };
+        let starting_state = self.selected_state.clone();
+        let priorities = Priorities::new(self.quality_priority.to_vec()).unwrap();
+        let polo_guide = self.polarization_guide.clone();
+        let max_memory = None;
+        let start_polo_num = 0;
+
+        let mut available_rollers = vec![];
+        for ship in &self.ships {
+            if ship.enabled {
+                available_rollers.push(AvailabileShips {
+                    ship: ship.ship,
+                    max_num_out: ship.number_available,
+                    max_used: ship.number_available,
+                });
+            }
+        }
+        self.calculation_handle = Some(std::thread::spawn(move || {
+            let output = get_best_roll_chart(
+                &available_rollers,
+                state,
+                starting_state,
+                &priorities,
+                max_memory,
+                polo_guide,
+                start_polo_num,
+            );
+            for plan in &output {
+                if let Some((_chart, qualities)) = plan {
+                    println!(
+                        "{}% {} {} {}",
+                        qualities.roll_out_probability * 100.,
+                        qualities.average_num_passes,
+                        qualities.max_num_out,
+                        qualities.num_polorizations,
+                    );
+                } else {
+                    println!("None")
+                }
+            }
+            ctx.request_repaint();
+            output
+        }));
     }
 
     fn add_chart_guide(&mut self, chart: RollingChart) {
@@ -142,7 +277,7 @@ impl RollApp {
             next_options(&guide.chart, &guide.path),
         );
         let taken_actions = match previous_next_options {
-            CachedNextOptions::Closed => unreachable!(),
+            CachedNextOptions::Closed => return,
             CachedNextOptions::Options(options) => {
                 let i = OPTIONS_ORDER.iter().position(|x| *x == decision).unwrap();
                 options.into_iter().skip(i).next().unwrap().unwrap()
@@ -152,68 +287,359 @@ impl RollApp {
     }
 
     fn show_selection_panel(&mut self, ui: &mut eframe::egui::Ui) {
-        if ui.button("Reset").clicked() {
-            if let Some(old_guide) = self.guide.take() {
-                self.add_chart_guide(old_guide.chart);
+        // Allocate space from bottom up for the error text first
+        ui.with_layout(Layout::bottom_up(eframe::egui::Align::LEFT), |ui| {
+            // Display Error at the absolute bottom if it exists
+            if !self.error.is_empty() {
+                ui.add_space(4.0);
+                ui.colored_label(Color32::RED, &self.error);
+                ui.separator();
             }
-        }
-        ComboBox::from_label("Select hole size")
-            .selected_text(if let Some(hole) = &self.selected_hole {
-                format!("{hole}")
-            } else {
-                "None".to_string()
-            })
-            .show_ui(ui, |ui| {
-                for hole in [
-                    HollSizes::M100,
-                    HollSizes::M500,
-                    HollSizes::M750,
-                    HollSizes::B1,
-                    HollSizes::B2,
-                    HollSizes::B3,
-                    HollSizes::B3_3,
-                    HollSizes::B5,
-                ] {
-                    ui.selectable_value(&mut self.selected_hole, Some(hole), format!("{hole}"));
+
+            // Fill the rest of the vertical space from the top down
+            ui.with_layout(Layout::top_down(eframe::egui::Align::LEFT), |ui| {
+                // Top Action Buttons
+                ui.horizontal(|ui| {
+                    if ui.button("Calculate").clicked() {
+                        self.calculate(ui.ctx().clone());
+                    }
+                    if ui.button("Reset").clicked() {
+                        self.error.clear();
+                        self.calculated_plans = None;
+                        if let Some(old_guide) = self.guide.take() {
+                            self.add_chart_guide(old_guide.chart);
+                        }
+                    }
+                });
+
+                ui.separator();
+
+                // Hole Properties
+                ui.heading("Hole Status");
+                Grid::new("hole_status_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Size:");
+                        ComboBox::from_id_salt("hole_size_combo")
+                            .selected_text(if let Some(hole) = &self.selected_hole {
+                                format!("{hole}")
+                            } else {
+                                "Select...".to_string()
+                            })
+                            .show_ui(ui, |ui| {
+                                for hole in [
+                                    HollSizes::M100,
+                                    HollSizes::M500,
+                                    HollSizes::M750,
+                                    HollSizes::B1,
+                                    HollSizes::B2,
+                                    HollSizes::B3,
+                                    HollSizes::B3_3,
+                                    HollSizes::B5,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.selected_hole,
+                                        Some(hole),
+                                        format!("{hole}"),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("State:");
+                        ComboBox::from_id_salt("hole_state_combo")
+                            .selected_text(format!("{}", self.selected_state))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.selected_state,
+                                    HoleState::Full,
+                                    "Full",
+                                );
+                                ui.selectable_value(
+                                    &mut self.selected_state,
+                                    HoleState::Shrink,
+                                    "Shrink",
+                                );
+                                ui.selectable_value(
+                                    &mut self.selected_state,
+                                    HoleState::Crit,
+                                    "Crit",
+                                );
+                            });
+                        ui.end_row();
+                    });
+
+                ui.separator();
+
+                const UP_TO_TEXT: &str = "Up to N polorizations";
+                const FIRST_POSSIBLE_TEXT: &str = "First possible + N";
+                // Polarization Strategy
+                ui.heading("Polorization Strategy");
+                Grid::new("polarization_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Limit Type:");
+                        ComboBox::from_id_salt("polarization_combo")
+                            .selected_text(match self.polarization_guide {
+                                PolorizationGuide::UpTo(_) => UP_TO_TEXT,
+                                PolorizationGuide::FirstPossiblePlusN(_) => FIRST_POSSIBLE_TEXT,
+                            })
+                            .show_ui(ui, |ui| {
+                                let is_upto =
+                                    matches!(self.polarization_guide, PolorizationGuide::UpTo(_));
+                                if ui.selectable_label(is_upto, UP_TO_TEXT).clicked() && !is_upto {
+                                    self.polarization_guide = PolorizationGuide::UpTo(3);
+                                }
+
+                                let is_first = matches!(
+                                    self.polarization_guide,
+                                    PolorizationGuide::FirstPossiblePlusN(_)
+                                );
+                                if ui.selectable_label(is_first, FIRST_POSSIBLE_TEXT).clicked()
+                                    && !is_first
+                                {
+                                    self.polarization_guide =
+                                        PolorizationGuide::FirstPossiblePlusN(1);
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label(match self.polarization_guide {
+                            PolorizationGuide::UpTo(_) => "Max Allowed:",
+                            PolorizationGuide::FirstPossiblePlusN(_) => "Extra After Found:",
+                        });
+                        match &mut self.polarization_guide {
+                            PolorizationGuide::UpTo(val)
+                            | PolorizationGuide::FirstPossiblePlusN(val) => {
+                                ui.add(DragValue::new(val).range(0..=u8::MAX));
+                            }
+                        }
+                        ui.end_row();
+                    });
+
+                ui.separator();
+
+                // Quality Priority Form
+                ui.heading("Quality Priority");
+                ui.label(
+                    eframe::egui::RichText::new("Order from highest (1) to lowest (3):").weak(),
+                );
+
+                let mut swap_indices = None;
+                for i in 0..3 {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(i > 0, eframe::egui::Button::new("⬆"))
+                            .clicked()
+                        {
+                            swap_indices = Some((i, i - 1));
+                        }
+                        if ui
+                            .add_enabled(i < 2, eframe::egui::Button::new("⬇"))
+                            .clicked()
+                        {
+                            swap_indices = Some((i, i + 1));
+                        }
+                        ui.label(format!("{}. {}", i + 1, self.quality_priority[i]));
+                    });
                 }
-            });
 
-        Grid::new("ships grid").show(ui, |ui| {
-            for ship in self.ships.iter_mut() {
-                ui.checkbox(&mut ship.enabled, &ship.name);
-                value_to_max_or_infinite(ui, &mut ship.number_available, 1..=MAX_NUM_AVAILABLE, 4);
-                value_to_max_or_infinite(ui, &mut ship.max_uses, 1..=MAX_MAX_USES, 4);
-            }
+                if let Some((a, b)) = swap_indices {
+                    self.quality_priority.swap(a, b);
+                }
+
+                ui.separator();
+
+                // Add Ship Form
+                ui.heading("Add Rolling Ship");
+                Grid::new("add_ship_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Name:");
+                        ui.add(
+                            TextEdit::singleline(&mut self.adding_name).hint_text("e.g. Megathron"),
+                        );
+                        ui.end_row();
+
+                        ui.label("Hot (tons):");
+                        ui.add(TextEdit::singleline(&mut self.adding_hot).hint_text("e.g. 100000"));
+                        ui.end_row();
+
+                        ui.label("Cold (tons):");
+                        ui.add(
+                            TextEdit::singleline(&mut self.adding_cold).hint_text("e.g. 100000"),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(4.0);
+                if ui.button("➕ Add Ship").clicked() {
+                    let hot = entered_tons_to_mass(&self.adding_hot);
+                    let cold = entered_tons_to_mass(&self.adding_cold);
+
+                    if self.adding_name.is_empty() {
+                        self.error = "Ship name cannot be empty.".to_string();
+                    } else if hot == 0 || cold == 0 {
+                        self.error =
+                            "Mass inputs must be valid numbers greater than 0.".to_string();
+                    } else {
+                        self.error.clear();
+                        self.ships.push(ProvidedShip {
+                            ship: Ship { hot, cold },
+                            name: self.adding_name.clone(),
+                            enabled: true,
+                            number_available: 1, // Start with 1 available
+                        });
+
+                        // Clear inputs on success
+                        self.adding_name.clear();
+                        self.adding_hot.clear();
+                        self.adding_cold.clear();
+                    }
+                }
+
+                ui.separator();
+
+                // Fleet Management
+                ui.heading("Fleet Configuration");
+                ScrollArea::vertical().show(ui, |ui| {
+                    if self.ships.is_empty() {
+                        ui.label(
+                            eframe::egui::RichText::new("No ships added.")
+                                .weak()
+                                .italics(),
+                        );
+                    } else {
+                        Grid::new("ships_grid")
+                            .num_columns(4)
+                            .spacing([15.0, 8.0])
+                            .show(ui, |ui| {
+                                let mut to_remove = None;
+                                for (i, ship) in self.ships.iter_mut().enumerate() {
+                                    ui.checkbox(&mut ship.enabled, &ship.name);
+                                    ui.label("Qty:");
+                                    ui.add(
+                                        DragValue::new(&mut ship.number_available)
+                                            .range(0..=u8::MAX)
+                                            .speed(0.1),
+                                    );
+                                    if ui.button("❌").on_hover_text("Delete Ship").clicked() {
+                                        to_remove = Some(i);
+                                    }
+                                    ui.end_row();
+                                }
+
+                                if let Some(idx) = to_remove {
+                                    self.ships.remove(idx);
+                                }
+                            });
+                    }
+                });
+            });
         });
-
-        ui.label("Add rolling ships\nWrite in tons exactly\nas seen on the fitting window");
-        ui.label("Hot:");
-        get_mass(ui, &mut self.adding_hot);
-        ui.label("Cold:");
-        get_mass(ui, &mut self.adding_cold);
-        ui.text_edit_singleline(&mut self.adding_name);
-        if ui.button("Add ship").clicked() {
-            if self.adding_name.is_empty()
-                || self.adding_cold == DEFAULT_MASS_TEXT
-                || self.adding_hot == DEFAULT_MASS_TEXT
-            {
-                return;
-            }
-            self.ships.push(ProvidedShip {
-                ship: Ship {
-                    hot: entered_tons_to_mass(&self.adding_hot),
-                    cold: entered_tons_to_mass(&self.adding_cold),
-                },
-                name: self.adding_name.take(),
-                enabled: true,
-                number_available: None,
-                max_uses: None,
-            });
-        }
     }
 
     fn walkthrough_roll(&mut self, ui: &mut eframe::egui::Ui) {
+        // 1. Check if we are currently waiting on a calculation thread
+        if let Some(is_finished) = self.calculation_handle.as_ref().map(|h| h.is_finished()) {
+            if is_finished {
+                let handle = self.calculation_handle.take().unwrap();
+                match handle.join() {
+                    Ok(result) => {
+                        self.calculated_plans = Some(filter_plans(result));
+                    }
+                    Err(_) => {
+                        self.error =
+                            "Calculation thread panicked or failed unexpectedly.".to_string();
+                    }
+                }
+            } else {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() / 2.0 - 50.0);
+                    ui.heading("Calculating...");
+                    ui.add_space(10.0);
+                    ui.add(Spinner::new().size(40.0));
+                });
+                return;
+            }
+        }
+
+        // 2. Display the plan selection if plans are calculated and guide is not set yet
+        if self.calculated_plans.is_some() && self.guide.is_none() {
+            let mut chosen_index = None;
+
+            ui.heading("Select a Rolling Plan");
+            ui.separator();
+
+            ScrollArea::vertical().show(ui, |ui| {
+                if let Some(plans) = &self.calculated_plans {
+                    if plans.is_empty() {
+                        ui.label("No viable plans found for this configuration.");
+                    } else {
+                        for (i, (_, q)) in plans.iter().enumerate() {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.heading(format!("Plan {}", i + 1));
+                                    ui.with_layout(
+                                        Layout::right_to_left(eframe::egui::Align::Center),
+                                        |ui| {
+                                            if ui.button("Select Plan").clicked() {
+                                                chosen_index = Some(i);
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.add_space(4.0);
+
+                                Grid::new(format!("plan_grid_{}", i))
+                                    .num_columns(2)
+                                    .spacing([40.0, 4.0])
+                                    .show(ui, |ui| {
+                                        ui.label("Roll Out Probability:");
+                                        ui.label(format_probability(q.roll_out_probability));
+                                        ui.end_row();
+
+                                        ui.label("Max Ships Out:");
+                                        ui.label(format!("{}", q.max_num_out));
+                                        ui.end_row();
+
+                                        ui.label("Average Passes:");
+                                        ui.label(format!("{:.2}", q.average_num_passes));
+                                        ui.end_row();
+
+                                        ui.label("Polarizations Required:");
+                                        ui.label(format!("{}", q.num_polorizations));
+                                        ui.end_row();
+                                    });
+                            });
+                            ui.add_space(8.0);
+                        }
+                    }
+                }
+            });
+
+            if let Some(idx) = chosen_index {
+                let mut plans = self.calculated_plans.take().unwrap();
+                let (chart, _) = plans.remove(idx);
+                self.add_chart_guide(chart);
+            }
+
+            return;
+        }
+
+        // 3. Existing standard logic
         let Some(guide) = &self.guide else {
+            if self.calculated_plans.is_none() && self.calculation_handle.is_none() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        eframe::egui::RichText::new("Enter details and click Calculate to begin.")
+                            .weak(),
+                    );
+                });
+            }
             return;
         };
         for (i, previous_actions) in guide.previous_options.iter().enumerate() {
@@ -275,7 +701,7 @@ enum CachedNextOptions {
 fn next_options(chart: &RollingChart, path: &[PassDecision]) -> CachedNextOptions {
     let mut walker = chart.chart_walker();
     for option in path {
-        walker.take_option(*option);
+        walker.take_option(*option).unwrap();
     }
     match walker.peak_options() {
         PeakedOptions::Closed => return CachedNextOptions::Closed,
@@ -292,44 +718,57 @@ fn next_options(chart: &RollingChart, path: &[PassDecision]) -> CachedNextOption
     }
 }
 
-fn value_to_max_or_infinite<T: Copy + Numeric>(
-    ui: &mut Ui,
-    value: &mut Option<T>,
-    range: RangeInclusive<T>,
-    default: T,
-) {
-    let mut available_is_infinite = value.is_none();
-    if ui
-        .checkbox(&mut available_is_infinite, "Infinite")
-        .changed()
-    {
-        if available_is_infinite {
-            *value = None;
-        } else {
-            *value = Some(default); // Give it a sensible default when unchecked
-        }
-    }
-
-    // 2. Handle the Number Slider (Disabled if Infinite is checked)
-    ui.add_enabled_ui(!available_is_infinite, |ui| {
-        // We use a temporary value to bind to the slider if it's currently None
-        let mut temp_val = value.unwrap_or(default);
-
-        // Use a Slider (or DragValue)
-        if ui.add(Slider::new(&mut temp_val, range)).changed() {
-            *value = Some(temp_val);
-        }
-    });
-}
-
-fn get_mass(ui: &mut Ui, value: &mut String) {
-    if ui.text_edit_singleline(value).lost_focus() {
-        if value.parse::<f64>().is_err() {
-            *value = DEFAULT_MASS_TEXT.to_string();
-        }
-    }
-}
-
 fn entered_tons_to_mass(value: &str) -> Mass {
-    (value.parse::<f64>().unwrap_or_default() * 1000.0).round() as Mass
+    (value.parse::<f64>().unwrap_or(0.0) * 1000.0).round() as Mass
+}
+
+fn format_probability(prob: f64) -> String {
+    if prob == 0.0 {
+        "0.000%".to_string()
+    } else if prob > 0.0 && (prob * 100.0) < 0.001 {
+        "< 0.001%".to_string()
+    } else {
+        format!("{:.3}%", prob * 100.0)
+    }
+}
+
+fn filter_plans(
+    raw_plans: Vec<Option<(RollingChart, Qualities)>>,
+) -> Vec<(RollingChart, Qualities)> {
+    // 1. Filter out all None results
+    let mut valid: Vec<(RollingChart, Qualities)> = raw_plans.into_iter().flatten().collect();
+
+    // 2. Identify redundant plans where qualities are equal except for higher num_polorizations
+    let mut to_remove = Vec::new();
+    let eps = 1e-9;
+
+    for i in 0..valid.len() {
+        for j in 0..valid.len() {
+            if i == j {
+                continue;
+            }
+            let qi = &valid[i].1;
+            let qj = &valid[j].1;
+
+            let same_core = qi.max_num_out == qj.max_num_out
+                && (qi.roll_out_probability - qj.roll_out_probability).abs() < eps
+                && (qi.average_num_passes - qj.average_num_passes).abs() < eps;
+
+            if same_core {
+                // If plan `i` requires strictly more polarizations than plan `j` with the same stats, flag it
+                if qi.num_polorizations > qj.num_polorizations {
+                    to_remove.push(i);
+                }
+            }
+        }
+    }
+
+    // 3. Apply the removal flags
+    to_remove.sort_unstable();
+    to_remove.dedup();
+    for &idx in to_remove.iter().rev() {
+        valid.remove(idx);
+    }
+
+    valid
 }
