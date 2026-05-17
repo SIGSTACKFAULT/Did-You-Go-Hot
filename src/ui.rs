@@ -40,7 +40,7 @@ impl Display for HoleState {
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, PartialEq, Eq, Copy)]
-enum HollSizes {
+enum HoleSize {
     M100,
     M500,
     M750,
@@ -51,32 +51,32 @@ enum HollSizes {
     B5,
 }
 
-impl Display for HollSizes {
+impl Display for HoleSize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HollSizes::M100 => write!(f, "100M"),
-            HollSizes::M500 => write!(f, "500M"),
-            HollSizes::M750 => write!(f, "750M"),
-            HollSizes::B1 => write!(f, "1B"),
-            HollSizes::B2 => write!(f, "2B"),
-            HollSizes::B3 => write!(f, "3B"),
-            HollSizes::B3_3 => write!(f, "3.3B"),
-            HollSizes::B5 => write!(f, "5B"),
+            HoleSize::M100 => write!(f, "100M"),
+            HoleSize::M500 => write!(f, "500M"),
+            HoleSize::M750 => write!(f, "750M"),
+            HoleSize::B1 => write!(f, "1B"),
+            HoleSize::B2 => write!(f, "2B"),
+            HoleSize::B3 => write!(f, "3B"),
+            HoleSize::B3_3 => write!(f, "3.3B"),
+            HoleSize::B5 => write!(f, "5B"),
         }
     }
 }
 
-impl HollSizes {
+impl HoleSize {
     fn hole_info(&self) -> HoleInfo {
         match self {
-            HollSizes::M100 => HoleInfo::from_kg(100_000_000),
-            HollSizes::M500 => HoleInfo::from_kg(500_000_000),
-            HollSizes::M750 => HoleInfo::from_kg(750_000_000),
-            HollSizes::B1 => HoleInfo::from_kg(1_000_000_000),
-            HollSizes::B2 => HoleInfo::from_kg(2_000_000_000),
-            HollSizes::B3 => HoleInfo::from_kg(3_000_000_000),
-            HollSizes::B3_3 => HoleInfo::from_kg(3_300_000_000),
-            HollSizes::B5 => HoleInfo::from_kg(5_000_000_000),
+            HoleSize::M100 => HoleInfo::from_kg(100_000_000),
+            HoleSize::M500 => HoleInfo::from_kg(500_000_000),
+            HoleSize::M750 => HoleInfo::from_kg(750_000_000),
+            HoleSize::B1 => HoleInfo::from_kg(1_000_000_000),
+            HoleSize::B2 => HoleInfo::from_kg(2_000_000_000),
+            HoleSize::B3 => HoleInfo::from_kg(3_000_000_000),
+            HoleSize::B3_3 => HoleInfo::from_kg(3_300_000_000),
+            HoleSize::B5 => HoleInfo::from_kg(5_000_000_000),
         }
     }
 }
@@ -122,7 +122,7 @@ struct RollApp {
     #[serde(skip)]
     calculated_plans: Option<Vec<(RollingChart, Qualities)>>,
 
-    selected_hole: Option<HollSizes>,
+    selected_hole: Option<HoleSize>,
     selected_state: HoleState,
     polarization_guide: PolorizationGuide,
     quality_priority: [Quality; 3],
@@ -437,14 +437,14 @@ impl RollApp {
                                     })
                                     .show_ui(ui, |ui| {
                                         for hole in [
-                                            HollSizes::M100,
-                                            HollSizes::M500,
-                                            HollSizes::M750,
-                                            HollSizes::B1,
-                                            HollSizes::B2,
-                                            HollSizes::B3,
-                                            HollSizes::B3_3,
-                                            HollSizes::B5,
+                                            HoleSize::M100,
+                                            HoleSize::M500,
+                                            HoleSize::M750,
+                                            HoleSize::B1,
+                                            HoleSize::B2,
+                                            HoleSize::B3,
+                                            HoleSize::B3_3,
+                                            HoleSize::B5,
                                         ] {
                                             ui.selectable_value(
                                                 &mut self.selected_hole,
