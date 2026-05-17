@@ -28,7 +28,7 @@ To build and run this project, you will need to use a **Nightly** Rust toolchain
 ## Building and Running
 
 ### Pre-compiled Binaries
-If you prefer not to build the application yourself, you can download pre-compiled executables for your operating system from the **[Releases](https://github.com/your-username/your-repo/releases)** page.
+If you prefer not to build the application yourself, you can download pre-compiled executables for your operating system from the **[Releases](https://github.com/Zagrest-fixes/Did-You-Go-Hot/releases)** page.
 
 ### Building from Source
 If you want to compile the project locally:
