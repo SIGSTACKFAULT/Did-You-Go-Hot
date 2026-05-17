@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 use tinyvec::ArrayVec;
 
 use crate::{
-    best_path_picker::{BestOptions, PathPicker, Priorities, Qualities},
+    best_path_picker::{BestOptions, PathPicker, Priorities, Qualities, QualitiesInt},
     chart_gen::RollingChart,
     hole_info::{EMPTY_MR, Mass, MassRange, mr},
     roll_calc::graph_builder::generate_roll_chart,
@@ -21,7 +21,8 @@ const EFFICIENT_MAX_NUM_OUT: usize = 4;
 const EFFICIENT_NUM_AVAILABLE_ROLLERS: usize = 2;
 const EFFICIENT_NUM_SHIP_STATES: usize = 2;
 
-type Memoizer<'a> = FxHashMap<RollState, SmallVec<[&'a RollPlan<'a>; EFFICIENT_NUM_CACHED_STEPS]>>;
+type Memoizer<'a> =
+    FxHashMap<RollState, Option<SmallVec<[&'a RollPlan<'a>; EFFICIENT_NUM_CACHED_STEPS]>>>;
 
 struct StaticData {
     max_single_jump_mass: Mass,
@@ -29,7 +30,7 @@ struct StaticData {
 
 #[derive(Debug, Clone)]
 pub struct RollPlan<'a> {
-    pub qualities: Qualities,
+    pub qualities: QualitiesInt,
     pub decision: RollDecision<'a>,
     pub mass_range: MassRange,
     pub max_mass_range: MassRange,
@@ -43,7 +44,7 @@ pub struct RollDecision<'a> {
     pub full: Option<&'a RollStep<'a>>,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 pub struct RollState {
     pub remaining_mass: MassRange,
     pub rollers_out: RollersUsed,
@@ -60,7 +61,7 @@ pub struct RollStep<'a> {
     pub ship: Ship,
 }
 
-type RollerOutBacking = u64;
+pub type RollerOutBacking = u64;
 const MAX_NUM_ROLLERS: usize = size_of::<RollerOutBacking>();
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -141,6 +142,7 @@ pub struct Ship {
     pub cold: Mass,
 }
 
+#[derive(Clone, Copy)]
 pub struct AvailabileShips {
     pub ship: Ship,
     pub max_num_out: u8,
@@ -157,14 +159,105 @@ impl Ship {
     }
 }
 
+pub enum PolorizationGuide {
+    UpTo(u8),
+    FirstPossiblePlusN(u8),
+}
+
 pub fn get_best_roll_chart(
     available_rollers: &[AvailabileShips],
     state: RollState,
     starting_state: HoleState,
     priorities: &Priorities,
     max_memory: Option<usize>,
-) -> (RollingChart, Qualities) {
+    polo_guide: PolorizationGuide,
+    start_polo_num: u8,
+) -> Vec<Option<(RollingChart, Qualities)>> {
     assert!(available_rollers.len() <= MAX_NUM_ROLLERS);
+    if let PolorizationGuide::UpTo(n) = polo_guide {
+        assert!(start_polo_num <= n);
+    }
+
+    let original_num_used: Vec<_> = available_rollers.iter().map(|r| r.max_used).collect();
+    let mut tmp_available_rollers: Option<Box<[AvailabileShips]>>;
+    if start_polo_num != 0 {
+        tmp_available_rollers = Some(available_rollers.to_vec().into_boxed_slice());
+    } else {
+        tmp_available_rollers = None;
+    }
+
+    let mut first_found_roll = None;
+
+    let mut output = vec![];
+    for allowed_num_polos in 0.. {
+        let this_available_rollers = if let Some(updated_ar) = &tmp_available_rollers {
+            updated_ar
+        } else {
+            available_rollers
+        };
+
+        let found_plan = get_best_roll_chart_atempt(
+            this_available_rollers,
+            state,
+            starting_state,
+            priorities,
+            max_memory,
+        );
+
+        if let Some((chart, qualities)) = found_plan {
+            output.push(Some((
+                chart,
+                Qualities {
+                    max_num_out: qualities.max_num_out,
+                    roll_out_probability: qualities.roll_out_probability,
+                    average_num_passes: qualities.average_num_passes,
+                    num_polorizations: allowed_num_polos,
+                },
+            )));
+            if first_found_roll.is_none() {
+                first_found_roll = Some(allowed_num_polos);
+            }
+        } else {
+            output.push(None);
+        }
+
+        match polo_guide {
+            PolorizationGuide::UpTo(n) => {
+                if allowed_num_polos == n {
+                    return output;
+                }
+            }
+            PolorizationGuide::FirstPossiblePlusN(n) => {
+                if let Some(first_found) = first_found_roll
+                    && allowed_num_polos - first_found >= n
+                {
+                    return output;
+                }
+            }
+        }
+
+        if tmp_available_rollers.is_none() {
+            tmp_available_rollers = Some(available_rollers.to_vec().into_boxed_slice());
+        }
+        for (roller, increment) in tmp_available_rollers
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(original_num_used.iter())
+        {
+            roller.max_used += increment;
+        }
+    }
+    unreachable!();
+}
+
+pub fn get_best_roll_chart_atempt(
+    available_rollers: &[AvailabileShips],
+    state: RollState,
+    starting_state: HoleState,
+    priorities: &Priorities,
+    max_memory: Option<usize>,
+) -> Option<(RollingChart, QualitiesInt)> {
     let arena = Bump::new();
     arena.set_allocation_limit(max_memory);
     let mut memoization = FxHashMap::default();
@@ -186,10 +279,10 @@ pub fn get_best_roll_chart(
         &mut memoization,
         &arena,
         &static_data,
-    ));
+    )?);
     println!("Num explored states = {}", memoization.len());
 
-    (generate_roll_chart(&plan), plan.qualities)
+    Some((generate_roll_chart(&plan), plan.qualities))
 }
 
 fn get_best_roll_plan_rec<'a>(
@@ -200,7 +293,7 @@ fn get_best_roll_plan_rec<'a>(
     memoization: &mut Memoizer<'a>,
     arena: &'a Bump,
     static_data: &StaticData,
-) -> &'a RollPlan<'a> {
+) -> Option<&'a RollPlan<'a>> {
     let base_max_num_out = state.rollers_out.num_rollers_out();
 
     // Fetch memoized best plan if it exists
@@ -275,8 +368,8 @@ fn get_best_roll_plan_rec<'a>(
 
     // If the hole is closed, the rollout probability is 0 if all rollers are in. Otherwise, it's 1.
     if all_possible_states == possible_states[3] {
-        return arena.alloc(RollPlan {
-            qualities: Qualities {
+        return Some(arena.alloc(RollPlan {
+            qualities: QualitiesInt {
                 max_num_out: base_max_num_out,
                 roll_out_probability: closed_roll_out_probability,
                 average_num_passes: 0.0,
@@ -289,7 +382,7 @@ fn get_best_roll_plan_rec<'a>(
             },
             mass_range: state.remaining_mass,
             max_mass_range: state.max_size_range,
-        });
+        }));
     }
 
     let cared_about_states = array::from_fn(|i| possible_states[i] > 0);
@@ -297,7 +390,10 @@ fn get_best_roll_plan_rec<'a>(
 
     let mut steps = get_steps(available_rollers, &state.rollers_out, &state.used_ships).into_iter();
 
-    let first_step = steps.next().unwrap();
+    let Some(first_step) = steps.next() else {
+        memoization.insert(state, None);
+        return None;
+    };
 
     let mut states_to_explore = ArrayVec::<[(usize, HoleState); 3]>::new();
     for i in 0..3 {
@@ -339,7 +435,10 @@ fn get_best_roll_plan_rec<'a>(
         }
     }
 
-    let BestOptions { best_paths, splits } = best_paths.best();
+    let Some(BestOptions { best_paths, splits }) = best_paths.best() else {
+        memoization.insert(state, None);
+        return None;
+    };
 
     let probabilities = f64x4::from_array(array::from_fn(|i| {
         geometric_probability(possible_states[i], all_possible_states)
@@ -371,18 +470,25 @@ fn get_best_roll_plan_rec<'a>(
     }
 
     let best_for_this_run = get_best_plan_from_cached(base_max_num_out, &best_plans);
-    memoization.insert(state, best_plans);
+    memoization.insert(state, Some(best_plans));
 
-    best_for_this_run
+    Some(best_for_this_run)
 }
 
 fn get_best_from_memoization<'a>(
     state: &RollState,
     min_max_num_out: u16,
     memoization: &Memoizer<'a>,
-) -> Option<&'a RollPlan<'a>> {
-    if let Some(cached_plans) = memoization.get(state) {
-        Some(get_best_plan_from_cached(min_max_num_out, cached_plans))
+) -> Option<Option<&'a RollPlan<'a>>> {
+    if let Some(cached_plans_o) = memoization.get(state) {
+        if let Some(cached_plans) = cached_plans_o {
+            Some(Some(get_best_plan_from_cached(
+                min_max_num_out,
+                &cached_plans,
+            )))
+        } else {
+            Some(None)
+        }
     } else {
         None
     }
@@ -448,7 +554,7 @@ fn create_roll_plan<'a>(
     }
     let [crit, shrink, full] = plans;
     arena.alloc(RollPlan {
-        qualities: Qualities {
+        qualities: QualitiesInt {
             max_num_out: min_max_num_out,
             roll_out_probability,
             average_num_passes,
@@ -490,7 +596,7 @@ fn compute_and_prune_or_add_step<'a>(
         return;
     }
 
-    let next_plan = get_best_roll_plan_rec(
+    let next_plan_o = get_best_roll_plan_rec(
         available_rollers,
         path_state,
         priorities,
@@ -500,22 +606,24 @@ fn compute_and_prune_or_add_step<'a>(
         static_data,
     );
 
-    best_paths.suggest(
-        RollStep {
-            next_plan,
-            direction: pass.direction,
-            ship_state: pass.ship_state,
-            ship: pass.ship,
-        },
-        hole_state,
-    );
+    if let Some(next_plan) = next_plan_o {
+        best_paths.suggest(
+            RollStep {
+                next_plan,
+                direction: pass.direction,
+                ship_state: pass.ship_state,
+                ship: pass.ship,
+            },
+            hole_state,
+        );
+    }
 }
 
 fn minimum_possible_qualities(
     available_rollers: &[AvailabileShips],
     path_state: &RollState,
     static_data: &StaticData,
-) -> Qualities {
+) -> QualitiesInt {
     let mut minimum_mass_needed_to_go_though_without_closing = 0;
     let mut max_return_mass = 0;
     let mut largest_ship: Option<Ship> = None;
@@ -574,7 +682,7 @@ fn minimum_possible_qualities(
         minimum_number_passes = 1.0;
     }
 
-    Qualities {
+    QualitiesInt {
         max_num_out: num_rollers_out,
         roll_out_probability: minimum_rollout_chance,
         average_num_passes: minimum_number_passes,

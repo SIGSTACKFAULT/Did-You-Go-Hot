@@ -8,7 +8,8 @@ use crate::{
     chart_gen::{ConnectionPass, EdgeData, PassDecision, RollingChart},
     hole_info::{HoleInfo, Mass},
     roll_calc::{
-        AvailabileShips, Direction, HoleState, RollState, RollersUsed, Ship, get_best_roll_chart,
+        AvailabileShips, Direction, HoleState, PolorizationGuide, RollState, RollersUsed, Ship,
+        get_best_roll_chart,
     },
 };
 
@@ -101,8 +102,17 @@ pub fn test_calced_roll_plans() {
         let starting_state = starting_state;
         let num_gigabytes = 16;
         let num_bytes = Some(num_gigabytes * 1024 * 1024 * 1024);
-        let (chart, qualities) =
-            get_best_roll_chart(rollers, state, starting_state, &priorities, num_bytes);
+        let (chart, qualities) = get_best_roll_chart(
+            rollers,
+            state,
+            starting_state,
+            &priorities,
+            num_bytes,
+            PolorizationGuide::UpTo(0),
+            0
+        )
+        .remove(0)
+        .unwrap();
         roll_plans.push((chart, qualities, hole, starting_state));
     }
 
@@ -155,16 +165,7 @@ fn simulate(mut hole: HoleData, plan: &RollingChart) -> Result<SimResult, ()> {
 
         let mut passes: Vec<_> = actions.iter().collect();
         // Pass Out and largest first to maximize rollout chance. Chart should not allow this to matter.
-        passes.sort_by(|(pass, _), (pass2, _)| {
-            // Prioritize Out passes over In passes
-            if pass.direction == Direction::Out && pass2.direction == Direction::In {
-                return Ordering::Less;
-            } else if pass.direction == Direction::In && pass2.direction == Direction::Out {
-                return Ordering::Greater;
-            }
-            // Prioritize larger mass first
-            pass.mass().cmp(&pass2.mass()).reverse()
-        });
+        passes.sort_by(|(pass, _), (pass2, _)| order_out_then_in_then_largeest(pass, pass2));
 
         // pass all but 1 since due to ordering, if there is a rollout it will be present when only 1 guy is left.
         for (i, (action, count)) in passes.iter().enumerate() {
@@ -217,4 +218,15 @@ fn hole_state(hole: HoleData) -> SimHoleState {
         return SimHoleState::Shrink;
     }
     SimHoleState::Full
+}
+
+pub fn order_out_then_in_then_largeest(pass: &ConnectionPass, pass2: &ConnectionPass) -> Ordering {
+    // Prioritize Out passes over In passes
+    if pass.direction == Direction::Out && pass2.direction == Direction::In {
+        return Ordering::Less;
+    } else if pass.direction == Direction::In && pass2.direction == Direction::Out {
+        return Ordering::Greater;
+    }
+    // Prioritize larger mass first
+    pass.mass().cmp(&pass2.mass()).reverse()
 }

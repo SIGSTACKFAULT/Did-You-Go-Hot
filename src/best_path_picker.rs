@@ -48,7 +48,7 @@ impl<'a, 'b> PathPicker<'a, 'b> {
         }
     }
 
-    pub fn should_prune(&self, hole_state: HoleState, minimum_qualities: &Qualities) -> bool {
+    pub fn should_prune(&self, hole_state: HoleState, minimum_qualities: &QualitiesInt) -> bool {
         let path_i = match hole_state {
             HoleState::Crit => 0,
             HoleState::Shrink => 1,
@@ -115,7 +115,16 @@ impl<'a, 'b> PathPicker<'a, 'b> {
 
     // Returns all best paths for each minimum max out floors.
     // Vec index = minimum max out floor
-    pub fn best(mut self) -> BestOptions<'a> {
+    pub fn best(mut self) -> Option<BestOptions<'a>> {
+        // If we care about a state, but it has no options return None
+        for (i, care_about) in self.care_about_state.iter().enumerate() {
+            if *care_about {
+                if self.best_paths[i].is_empty() {
+                    return None;
+                }
+            }
+        }
+
         // Get it to a single plan per max_num_out value
         // Keeping the highest mass being passed to try to improve path similarity.
         for path in self.best_paths.iter_mut() {
@@ -142,10 +151,10 @@ impl<'a, 'b> PathPicker<'a, 'b> {
             .map(|x| x.next_plan.qualities.max_num_out)
             .max()
         else {
-            return BestOptions {
+            return Some(BestOptions {
                 best_paths: SmallVec::new(),
                 splits: SmallVec::new(),
-            };
+            });
         };
 
         let mut possible_combos: SmallVec<[[Option<RollStep>; 3]; EFFICIENT_NUM_BEST_OPTIONS]> =
@@ -177,18 +186,18 @@ impl<'a, 'b> PathPicker<'a, 'b> {
             }
         }
 
-        BestOptions {
+        Some(BestOptions {
             best_paths: possible_combos,
             splits,
-        }
+        })
     }
 }
 
 // best_paths[path_i] must be properly filtered such all elements with higher prioirty qualities which are better are not included.
 // best_paths must be sorted to match the invariants of PathPicker.
 fn cmp<'a>(
-    existing: &Qualities,
-    new: &Qualities,
+    existing: &QualitiesInt,
+    new: &QualitiesInt,
     priorities: &[Quality],
     best_paths: &[SmallVec<[RollStep<'a>; EFFICIENT_NUM_EQUAL_OR_POTENTIALLY_BETTER]>; 3],
     path_i: usize,
@@ -294,8 +303,8 @@ fn cmp<'a>(
 // best_paths[path_i] must be properly filtered such all elements with higher prioirty qualities which are better are not included.
 // best_paths must be sorted to match the invariants of PathPicker.
 fn cmp_theoretical(
-    existing: &Qualities,
-    new: &Qualities,
+    existing: &QualitiesInt,
+    new: &QualitiesInt,
     priorities: &[Quality],
     best_paths: &[SmallVec<[RollStep; EFFICIENT_NUM_EQUAL_OR_POTENTIALLY_BETTER]>; 3],
     path_i: usize,
@@ -428,8 +437,16 @@ impl Priorities {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct QualitiesInt {
+    pub max_num_out: u16,
+    pub roll_out_probability: f64,
+    pub average_num_passes: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct Qualities {
     pub max_num_out: u16,
     pub roll_out_probability: f64,
     pub average_num_passes: f64,
+    pub num_polorizations: u8,
 }

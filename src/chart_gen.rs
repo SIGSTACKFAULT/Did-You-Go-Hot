@@ -1,9 +1,15 @@
-use petgraph::{graph::NodeIndex, prelude::StableDiGraph, visit::IntoEdgeReferences};
+use petgraph::{
+    graph::{self, NodeIndex},
+    prelude::StableDiGraph,
+    stable_graph::EdgeReference,
+    visit::IntoEdgeReferences,
+};
 use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::{
     hole_info::Mass,
+    hole_plan_tester::order_out_then_in_then_largeest,
     roll_calc::{Direction, Ship, ShipState},
 };
 use petgraph::algo::toposort;
@@ -58,7 +64,7 @@ pub struct RollingChart {
     graph: StableDiGraph<Node, EdgeData>,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
 pub enum PassDecision {
     Closed,
     Crit,
@@ -371,8 +377,8 @@ impl RollingChart {
     }
 
     pub fn compress(&mut self) {
-        // self.compress_direct_to_closed();
-        // self.compress_no_decision_chains();
+        self.compress_direct_to_closed();
+        self.compress_no_decision_chains();
         // self.combine_identical_decision_paths();
         // // Rerun compress_no_decision_chains to clean up any new chains created by combine_identical_decision_paths
         // self.compress_no_decision_chains();
@@ -416,20 +422,7 @@ impl RollingChart {
             let _ = writeln!(chart, "n_{} -->|{}", from_idx.index(), decision_text);
 
             // Add pass details
-            for (pass, num) in &edge.weight().actions {
-                let mass = pass.mass() / MASS_DIVISOR;
-
-                let dir = match pass.direction {
-                    Direction::In => "IN",
-                    Direction::Out => "OUT",
-                };
-
-                let _ = write!(chart, "{} {}", dir, mass);
-                if *num > 1 {
-                    let _ = write!(chart, " x{}", num);
-                }
-                let _ = writeln!(chart);
-            }
+            write!(chart, "{}", actions_to_text(&edge.weight().actions));
 
             // Determine destination text.
             // For Closed, we generate a unique ID so lines do not converge.
@@ -449,6 +442,7 @@ impl RollingChart {
             graph: &self.graph,
             current: self.head,
             closed: self.closed,
+            head: self.head,
         }
     }
 }
@@ -457,33 +451,99 @@ pub struct ChartWalker<'a> {
     graph: &'a StableDiGraph<Node, EdgeData>,
     current: NodeIndex<u32>,
     closed: NodeIndex<u32>,
+    head: NodeIndex<u32>,
+}
+
+pub enum PeakedOptions<'a> {
+    Options(Vec<&'a EdgeData>),
+    Closed,
 }
 
 impl<'a> ChartWalker<'a> {
-    pub fn peak_options(&self) -> impl Iterator<Item = &EdgeData> {
-        self.graph
-            .edges_directed(self.current, petgraph::Direction::Outgoing)
-            .map(|e| e.weight())
+    pub fn peak_options(&self) -> PeakedOptions<'a> {
+        if self.current == self.closed {
+            PeakedOptions::Closed
+        } else {
+            PeakedOptions::Options(
+                out_edge_iter(&self.graph, self.current)
+                    .map(|e| e.weight())
+                    .collect(),
+            )
+        }
     }
 
+    // pub fn peak_future_options(
+    //     &self,
+    //     decision: PassDecision,
+    // ) -> Option<impl Iterator<Item = &EdgeData>> {
+    //     let Some(edge) = edge_path(self.graph, self.current, decision) else {
+    //         return None;
+    //     };
+    //     Some(out_edge_iter(&self.graph, edge.target()).map(|e| e.weight()))
+    // }
+
     pub fn take_option(&mut self, decision: PassDecision) -> Result<&EdgeData, ()> {
-        for edge in self
-            .graph
-            .edges_directed(self.current, petgraph::Direction::Outgoing)
-        {
-            let edge_decision = edge.weight().decision;
-            let found = match edge_decision {
-                PassDecision::NotClosed => matches!(
-                    decision,
-                    PassDecision::Crit | PassDecision::Shrink | PassDecision::Full
-                ),
-                _ => edge_decision == decision,
-            };
-            if found {
-                self.current = edge.target();
-                return Ok(edge.weight());
-            }
+        if let Some(edge) = edge_path(self.graph, self.current, decision) {
+            self.current = edge.target();
+            return Ok(edge.weight());
         }
         Err(())
     }
+
+    pub fn reset(&mut self) {
+        self.current = self.head;
+    }
+}
+
+pub fn actions_to_text(actions: &HashMap<ConnectionPass, u16>) -> String {
+    let mut out = String::new();
+    let mut options: Vec<_> = actions.iter().collect();
+    options.sort_by(|(pass, _), (pass2, _)| order_out_then_in_then_largeest(pass, pass2));
+
+    for (i, (pass, num)) in options.iter().enumerate() {
+        let mass = pass.mass() / MASS_DIVISOR;
+
+        let dir = match pass.direction {
+            Direction::In => "IN",
+            Direction::Out => "OUT",
+        };
+
+        let _ = write!(out, "{} {}", dir, mass);
+        if **num > 1 {
+            let _ = write!(out, " x{}", num);
+        }
+
+        if i != options.len() - 1 {
+            let _ = writeln!(out);
+        }
+    }
+    out
+}
+
+fn edge_path(
+    graph: &StableDiGraph<Node, EdgeData>,
+    current: NodeIndex,
+    decision: PassDecision,
+) -> Option<EdgeReference<EdgeData>> {
+    for edge in graph.edges_directed(current, petgraph::Direction::Outgoing) {
+        let edge_decision = edge.weight().decision;
+        let found = match edge_decision {
+            PassDecision::NotClosed => matches!(
+                decision,
+                PassDecision::Crit | PassDecision::Shrink | PassDecision::Full
+            ),
+            _ => edge_decision == decision,
+        };
+        if found {
+            return Some(edge);
+        }
+    }
+    None
+}
+
+fn out_edge_iter(
+    graph: &StableDiGraph<Node, EdgeData>,
+    current: NodeIndex,
+) -> impl Iterator<Item = EdgeReference<EdgeData>> {
+    graph.edges_directed(current, petgraph::Direction::Outgoing)
 }

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bumpalo = "3.20.2"
+eframe = "0.34.1"
 petgraph = "0.8.3"
 rand = "0.10.1"
 rustc-hash = "2.1.2"
