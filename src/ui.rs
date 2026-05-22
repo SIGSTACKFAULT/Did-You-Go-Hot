@@ -573,6 +573,39 @@ impl RollApp {
 
                         // Add Ship Form
                         ui.heading("Add Rolling Ship");
+
+                        const SAMPLES: &[(&str, i64, i64)] = &[
+                            ("Higgs BB", 200_000, 300_000),
+                            ("PHIC Omen", 26_000, 126_000),
+                            ("Combat NOmen", 10_850, 15_850),
+                        ];
+
+                        // combobox for the dropdown, doesn't use the actual selection behaviourk
+                        ComboBox::from_id_salt("roller_samples")
+                            .selected_text("Samples...")
+                            .show_ui(ui, |ui| {
+                                fn format_mass(mass: i64) -> String {
+                                    if mass % 1000 == 0 {
+                                        format!("{}kt", mass/1000)
+                                    } else {
+                                        format!("{}t", mass)
+                                    }
+                                }
+                                for sample in SAMPLES {
+                                    let cold_str = format_mass(sample.1);
+                                    let hot_str = format_mass(sample.2);
+                                    if ui.selectable_label(false, format!("{} - {}/{}", sample.0, cold_str, hot_str)).clicked() {
+                                        self.ships.push(ProvidedShip {
+                                            ship: Ship {cold: sample.1 * 1000, hot: sample.2 * 1000},
+                                            name: sample.0.to_string(),
+                                            enabled: true,
+                                            number_available: 1,
+                                            already_outside: 0,
+                                        });
+                                        dbg!(&self.ships);
+                                    };
+                                }
+                            });
                         Grid::new("add_ship_grid")
                             .num_columns(2)
                             .spacing([20.0, 8.0])
@@ -587,14 +620,14 @@ impl RollApp {
                                 ui.label("Hot (tons):");
                                 ui.add(
                                     TextEdit::singleline(&mut self.adding_hot)
-                                        .hint_text("e.g. 100000"),
+                                        .hint_text("e.g. 300000"),
                                 );
                                 ui.end_row();
 
                                 ui.label("Cold (tons):");
                                 ui.add(
                                     TextEdit::singleline(&mut self.adding_cold)
-                                        .hint_text("e.g. 100000"),
+                                        .hint_text("e.g. 200000"),
                                 );
                                 ui.end_row();
                             });
